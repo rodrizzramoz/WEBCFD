@@ -111,3 +111,16 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
 .nav a { padding: 5px 14px; color: var(--ink); text-decoration: none; font-weight: 500; border-right: 1px solid var(--line); }
 .nav a:last-child { border-right: 0; }
 .nav a[aria-current="page"] { background: var(--accent); color: var(--accent-ink); }
+
+/* Custom ports list on the flow page */
+.conds { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.conds li { display: grid; grid-template-columns: 12px 1fr; gap: 6px 8px; align-items: center; font-size: 13px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.conds li.hot { border-color: var(--accent); }
+.conds .dot { width: 12px; height: 12px; border-radius: 3px; background: var(--muted); }
+.conds .dot.feed { background: #35c26b; }
+.conds .dot.open { background: #4fb0f0; }
+.conds .row2 { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 90px; gap: 6px; }
+.porttable { width: 100%; border-collapse: collapse; font-size: 13px; }
+.porttable th, .porttable td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.porttable th:first-child, .porttable td:first-child { text-align: left; }
+.porttable th { color: var(--muted); font-weight: 500; }

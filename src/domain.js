@@ -9,6 +9,8 @@
 
 export const FLUID = 0, SOLID = 1, FARFIELD = 2, INLET = 3, OUTLET = 4;
 export const NORMALS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+import { addWallDistances } from "./walls.js";
+
 export const FACE_NAMES = ["X min", "X max", "Y min", "Y max", "Z min", "Z max"];
 
 // Winding-number voxeliser. Casts one ray along +X through every (y, z) cell
@@ -98,9 +100,10 @@ export function domainBox(tris, opt) {
   }
   const dx = Math.max(bb.size[0], bb.size[1], bb.size[2]) / opt.res;
   const origin = [0, 0, 0], dims = [0, 0, 0];
+  const allFaces = opt.portMode === "ports"; // custom ports can sit on any face, so every face is flush with the part
   for (let a = 0; a < 3; a++) {
-    const onMin = opt.inletFace === 2 * a || opt.outletFace === 2 * a;
-    const onMax = opt.inletFace === 2 * a + 1 || opt.outletFace === 2 * a + 1;
+    const onMin = allFaces || opt.inletFace === 2 * a || opt.outletFace === 2 * a;
+    const onMax = allFaces || opt.inletFace === 2 * a + 1 || opt.outletFace === 2 * a + 1;
     const e = bb.size[a] / dx;
     if (onMin && onMax) { origin[a] = bb.min[a]; dims[a] = Math.max(3, Math.floor(e + 0.5)); }
     else if (onMin) { origin[a] = bb.min[a]; dims[a] = Math.ceil(e) + 1; }
@@ -194,12 +197,14 @@ export function buildDomain(tris, opt) {
     grid.refLength = box.bb.size[0];
     grid.inVec = [1, 0, 0];
     grid.speedUp = 1.5;
+    if (opt.walls === "exact") addWallDistances(grid, tris, (c) => raw[c] === 1);
     return grid;
   }
 
   // Internal flow.
   const fluidIsInside = opt.stlIsFluid;
   const isOpen = (c) => (raw[c] === 1) === fluidIsInside;
+  if (opt.portMode === "ports") return buildPorts(grid, tris, opt, box, isOpen);
   const interior = (c) => {
     const i = c % nx, j = ((c / nx) | 0) % ny, k = (c / (nx * ny)) | 0;
     return i > 0 && j > 0 && k > 0 && i < nx - 1 && j < ny - 1 && k < nz - 1;
@@ -250,5 +255,126 @@ export function buildDomain(tris, opt) {
   grid.outNormal = NORMALS[opt.outletFace];
   grid.fluidCells = queue.length;
   grid.portsOutside = [inOpen.outsideOnly ? opt.inletFace : -1, outOpen.outsideOnly ? opt.outletFace : -1].filter((f) => f >= 0);
+  if (opt.walls === "exact") addWallDistances(grid, tris, (c) => !isOpen(c));
+  return grid;
+}
+
+// ---------- Custom ports ----------
+// Every separate opening where the flow space meets a face of the bounding box.
+// Returns [{face, cells, area, centre: [x, y, z], rim}] where rim means the opening
+// reaches the edge of the face (usually the space around the part, not a real port).
+export function listOpenings(dims, origin, dx, isOpen) {
+  const out = [];
+  for (let face = 0; face < 6; face++) {
+    const { cells, nu, nv } = layerCells(face, dims);
+    const count = nu * nv, comp = new Int32Array(count).fill(-1);
+    for (let m0 = 0; m0 < count; m0++) {
+      if (comp[m0] >= 0 || !isOpen(cells[3 * m0])) continue;
+      const id = out.length, list = [], stack = [m0];
+      let rim = false, su = 0, sv = 0;
+      comp[m0] = id;
+      while (stack.length) {
+        const m = stack.pop(), u = m % nu, v = (m / nu) | 0;
+        list.push(cells[3 * m]); su += u; sv += v;
+        if (u === 0 || v === 0 || u === nu - 1 || v === nv - 1) rim = true;
+        for (const q of [u > 0 ? m - 1 : -1, u < nu - 1 ? m + 1 : -1, v > 0 ? m - nu : -1, v < nv - 1 ? m + nu : -1]) {
+          if (q >= 0 && comp[q] < 0 && isOpen(cells[3 * q])) { comp[q] = id; stack.push(q); }
+        }
+      }
+      const a = face >> 1, b = (a + 1) % 3, c = (a + 2) % 3, centre = [0, 0, 0];
+      centre[a] = origin[a] + (face & 1 ? dims[a] * dx : 0);
+      centre[b] = origin[b] + (su / list.length + 0.5) * dx;
+      centre[c] = origin[c] + (sv / list.length + 0.5) * dx;
+      // cell centres on the face plane, and the one nearest the middle as a point that is surely inside
+      const pts = new Float32Array(list.length * 3), nx = dims[0], ny = dims[1];
+      let point = centre, bd = Infinity;
+      list.forEach((cell, n) => {
+        const ijk = [cell % nx, ((cell / nx) | 0) % ny, (cell / (nx * ny)) | 0], q = [0, 0, 0];
+        q[a] = centre[a]; q[b] = origin[b] + (ijk[b] + 0.5) * dx; q[c] = origin[c] + (ijk[c] + 0.5) * dx;
+        pts.set(q, 3 * n);
+        const d = (q[b] - centre[b]) ** 2 + (q[c] - centre[c]) ** 2;
+        if (d < bd) { bd = d; point = q; }
+      });
+      out.push({ face, cells: list, area: list.length * dx * dx, centre, point, pts, rim });
+    }
+  }
+  return out;
+}
+
+// Openings of a model at the current settings, for the ports list in the UI.
+export function scanOpenings(tris, opt) {
+  const box = domainBox(tris, { ...opt, portMode: "ports" });
+  const [nx, ny, nz] = box.dims;
+  const raw = voxelize(tris, box.origin, box.dx, nx, ny, nz);
+  const isOpen = (c) => (raw[c] === 1) === opt.stlIsFluid;
+  return { box, openings: listOpenings(box.dims, box.origin, box.dx, isOpen).filter((o) => o.cells.length >= 2) };
+}
+
+// Which found opening a saved port refers to: on the same face, the one with a cell closest to the port's point.
+export function matchPort(port, openings) {
+  let best = null, bd = Infinity;
+  for (const o of openings) {
+    if (o.face !== port.face) continue;
+    for (let n = 0; n < o.pts.length; n += 3) {
+      const d = (o.pts[n] - port.point[0]) ** 2 + (o.pts[n + 1] - port.point[1]) ** 2 + (o.pts[n + 2] - port.point[2]) ** 2;
+      if (d < bd) { bd = d; best = o; }
+    }
+  }
+  return best;
+}
+
+// Flow domain with any number of ports. opt.ports: [{face, point, type: "feed" | "open", speed}]
+function buildPorts(grid, tris, opt, box, isOpen) {
+  const { nx, ny, nz, n, dx, flags } = grid;
+  const stride = [1, nx, nx * ny];
+  const openings = listOpenings(box.dims, box.origin, dx, isOpen);
+  const ports = [];
+  for (const p of opt.ports || []) {
+    const o = matchPort(p, openings);
+    if (!o) throw new Error("A port on the " + FACE_NAMES[p.face] + " face no longer matches any opening. Press Find openings again.");
+    if (ports.some((q) => q.opening === o)) continue;
+    ports.push({ type: p.type, speed: p.type === "feed" ? p.speed : 0, face: o.face, opening: o });
+  }
+  if (ports.length > 8) throw new Error("At most 8 ports are supported. Set some openings back to Wall.");
+  if (!ports.some((p) => p.type === "feed" && p.speed > 0)) throw new Error("Set at least one opening to Air fed in, with a speed above zero.");
+  if (!ports.some((p) => p.type === "open")) throw new Error("Set at least one opening to Open to atmosphere, so the air has somewhere to go.");
+  const interior = (c) => {
+    const i = c % nx, j = ((c / nx) | 0) % ny, k = (c / (nx * ny)) | 0;
+    return i > 0 && j > 0 && k > 0 && i < nx - 1 && j < ny - 1 && k < nz - 1;
+  };
+  const reached = new Uint8Array(n), queue = [];
+  for (const p of ports) {
+    const nrm = NORMALS[p.face];
+    p.step = nrm[0] * stride[0] + nrm[1] * stride[1] + nrm[2] * stride[2];
+    for (const c of p.opening.cells) {
+      const q = c + p.step;
+      if (interior(q) && isOpen(q) && !reached[q]) { reached[q] = 1; queue.push(q); }
+    }
+  }
+  for (let h = 0; h < queue.length; h++) {
+    const c = queue[h];
+    for (let a = 0; a < 3; a++) for (const q of [c - stride[a], c + stride[a]]) {
+      if (!reached[q] && interior(q) && isOpen(q)) { reached[q] = 1; queue.push(q); }
+    }
+  }
+  flags.fill(SOLID);
+  for (const c of queue) flags[c] = FLUID;
+  grid.ports = ports.map((p, id) => {
+    const nbr = [];
+    for (const c of p.opening.cells) if (reached[c + p.step]) { flags[c] = (p.type === "feed" ? INLET : OUTLET) | (p.face << 3) | (id << 6); nbr.push(c + p.step); }
+    if (!nbr.length) throw new Error("The opening on the " + FACE_NAMES[p.face] + " face is blocked right behind the face at this grid detail. Raise the grid detail.");
+    return { type: p.type, speed: p.speed, face: p.face, normal: NORMALS[p.face], nbr: Uint32Array.from(nbr), area: nbr.length * dx * dx, centre: p.opening.centre };
+  });
+  const feeds = grid.ports.filter((p) => p.type === "feed");
+  const fastest = feeds.reduce((a, b) => (b.speed > a.speed ? b : a));
+  grid.portMode = true;
+  grid.speedUp = 1.5;
+  grid.refSpeed = fastest.speed;
+  grid.refLength = Math.sqrt(4 * fastest.area / Math.PI);
+  grid.inletArea = fastest.area;
+  grid.inVec = fastest.normal;
+  grid.fluidCells = queue.length;
+  grid.portsOutside = [];
+  if (opt.walls === "exact") addWallDistances(grid, tris, (c) => !isOpen(c));
   return grid;
 }

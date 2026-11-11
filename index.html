@@ -97,7 +97,19 @@
           </div>
         </div>
         <div id="internalOpts" hidden>
-          <div class="two">
+          <div class="field">
+            <label for="portMode">Openings</label>
+            <select id="portMode">
+              <option value="simple">Simple: one inlet face, one outlet face</option>
+              <option value="ports">Custom: set each opening (air jets, several inlets)</option>
+            </select>
+          </div>
+          <div id="portsBox" hidden>
+            <button type="button" class="btn" id="findPorts">Find openings</button>
+            <ul class="conds" id="portList"></ul>
+            <p class="small">Each opening where the flow space meets the outside of the part is listed. Set the one fed with compressed air to "Air fed in" with its speed, and the mouth and exit to "Open to atmosphere". The air drawn in through the open ones is the result. Hover a row to see it in the 3D view.</p>
+          </div>
+          <div class="two" id="simplePorts">
             <div class="field">
               <label for="inletFace">Inlet face</label>
               <select id="inletFace"></select>
@@ -147,6 +159,13 @@
               <option value="1.5">Roomy</option>
             </select>
           </div>
+        </div>
+        <div class="field">
+          <label for="walls">Wall shape</label>
+          <select id="walls">
+            <option value="exact" selected>Follow the true surface (accurate)</option>
+            <option value="cubes">Cube steps (fastest, for visualisation)</option>
+          </select>
         </div>
         <div class="two">
           <button type="button" class="btn" id="meshBtn" aria-pressed="false">Preview mesh</button>

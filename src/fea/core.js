@@ -122,6 +122,20 @@ export class Model {
     for (let d = 0; d < out.length; d++) out[d] *= free[d];
   }
 
+  // True residual of the current u in scaled units: out = f / (E h) - K u.
+  // Returns its norm relative to the load. Used by the GPU path, which solves
+  // in 32-bit floats and checks and corrects the answer here in 64-bit.
+  residual(out) {
+    const { u, f, ndof } = this, k = this.E * this.h;
+    let fn = 0, any = false;
+    for (let d = 0; d < ndof; d++) { fn += f[d] * f[d]; if (u[d] !== 0) any = true; }
+    if (fn === 0) { out.fill(0); return 0; }
+    if (any) this.multiply(u, out); else out.fill(0);
+    let rn = 0;
+    for (let d = 0; d < ndof; d++) { const v = f[d] / k - out[d]; out[d] = v; rn += v * v; }
+    return Math.sqrt(rn / fn) * k;
+  }
+
   // Solves K u = f, starting from the current u. Returns iterations and final relative residual.
   solve(tol, maxIter, onProgress) {
     const { u, f, free, ndof, conn, KE, scale, ne } = this;
@@ -171,9 +185,12 @@ export class Model {
     return { iterations: it, residual: rn * k / fnorm };
   }
 
+  // The post-processing below works on any displacement array (3 per grid node),
+  // whichever solver produced it. It defaults to this model's own u.
+
   // Strain energy per element for unit stiffness multiplier: u_e . KE u_e * E * h
-  elementEnergy(out) {
-    const { conn, KE, u, ne } = this, ue = this._ue, k = this.E * this.h;
+  elementEnergy(out, u = this.u) {
+    const { conn, KE, ne } = this, ue = this._ue, k = this.E * this.h;
     for (let e = 0; e < ne; e++) {
       for (let n = 0; n < 8; n++) {
         const d = 3 * conn[e * 8 + n];
@@ -189,15 +206,15 @@ export class Model {
     }
   }
 
-  compliance() {
+  compliance(u = this.u) {
     let c = 0;
-    for (let d = 0; d < this.ndof; d++) c += this.f[d] * this.u[d];
+    for (let d = 0; d < this.ndof; d++) c += this.f[d] * u[d];
     return c; // joules; equals twice the stored strain energy
   }
 
   // Von Mises stress at each element centre, for full-strength material (Pa).
-  vonMises(out) {
-    const { conn, u, ne, B0, D, h, E } = this, ue = this._ue;
+  vonMises(out, u = this.u) {
+    const { conn, ne, B0, D, h, E } = this, ue = this._ue;
     const eps = new Float64Array(6), sig = new Float64Array(6);
     for (let e = 0; e < ne; e++) {
       for (let n = 0; n < 8; n++) {
@@ -219,9 +236,8 @@ export class Model {
     }
   }
 
-  maxDisplacement() {
+  maxDisplacement(u = this.u) {
     let m = 0;
-    const u = this.u;
     for (let d = 0; d < u.length; d += 3) {
       const v = u[d] * u[d] + u[d + 1] * u[d + 1] + u[d + 2] * u[d + 2];
       if (v > m) m = v;
@@ -262,9 +278,15 @@ export class Optimiser {
 
   // One design update toward the target volume fraction. Returns the largest density change.
   update(volFrac, solveTol = 1e-3, solveIter = 600) {
-    const { x, m, penal, emin, dc, dcf, nb, w, start } = this, ne = m.ne;
     this.applyDensities();
-    const info = m.solve(solveTol, solveIter);
+    return this.finishUpdate(volFrac, this.m.solve(solveTol, solveIter));
+  }
+
+  // Second half of update: sensitivities, filter and the optimality criteria step.
+  // Call it after applyDensities() and a solve of the model by any solver
+  // (info is what that solve returned).
+  finishUpdate(volFrac, info) {
+    const { x, m, penal, emin, dc, dcf, nb, w, start } = this, ne = m.ne;
     m.elementEnergy(this.energy);
     for (let e = 0; e < ne; e++) dc[e] = -penal * Math.pow(x[e], penal - 1) * (1 - emin) * this.energy[e];
     for (let e = 0; e < ne; e++) {

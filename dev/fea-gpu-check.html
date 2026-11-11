@@ -1,0 +1,98 @@
+<!DOCTYPE html><html><body><script type="module">
+// Standalone check page for the FEA GPU solver. Driven from Playwright
+// through the functions placed on window below.
+import { Model } from "/src/fea/core.js";
+import { GpuSolver } from "/src/fea/gpu.js";
+
+// Cantilever of nx x ny x nz cells, fixed at x = 0, tip load in -z.
+// kind: "beam" (uniform), "random" (stiffness multipliers between 0.001 and 1),
+// "L" (L-shaped domain: the upper outer quarter of the block is empty).
+function setup(nx, ny, nz, kind) {
+  const L = 0.1, h = L / nx, NX = nx + 1, NY = ny + 1, NZ = nz + 1;
+  const solid = new Uint8Array(nx * ny * nz).fill(1);
+  if (kind === "L") for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
+    if (i >= nx / 2 && k >= nz / 2) solid[i + nx * (j + ny * k)] = 0;
+  const fixed = new Uint8Array(NX * NY * NZ), force = new Float64Array(3 * NX * NY * NZ);
+  const P = 100, tip = [];
+  const topZ = kind === "L" ? nz / 2 : nz;
+  for (let k = 0; k < NZ; k++) for (let j = 0; j < NY; j++) { fixed[NX * (j + NY * k)] = 1; if (k <= topZ) tip.push(nx + NX * (j + NY * k)); }
+  for (const n of tip) force[3 * n + 2] = -P / tip.length;
+  return { s: { nx, ny, nz, h, solid, fixed, force, E: 2e9, nu: 0.3 }, P, L, h, tip };
+}
+function build(nx, ny, nz, kind) {
+  const c = setup(nx, ny, nz, kind), m = new Model(c.s);
+  if (kind === "random") { let seed = 12345; for (let e = 0; e < m.ne; e++) { seed = (seed * 1664525 + 1013904223) >>> 0; m.scale[e] = 0.001 + 0.999 * seed / 4294967296; } }
+  return { m, ...c };
+}
+const tipOf = (m, tip) => { let t = 0; for (const n of tip) t += m.u[3 * n + 2]; return -t / tip.length; };
+
+window.setupFor = (nx, ny, nz, kind) => setup(nx, ny, nz, kind).s;
+
+// Solves one case on both solvers and compares.
+window.compare = async (nx, ny, nz, kind, tol = 1e-6, maxIter = 20000) => {
+  const a = build(nx, ny, nz, kind), b = build(nx, ny, nz, kind);
+  let t = performance.now();
+  const ci = a.m.solve(tol, maxIter); const cpuMs = performance.now() - t;
+  t = performance.now();
+  const g = await GpuSolver.create(b.m); const setupMs = performance.now() - t;
+  t = performance.now();
+  const gi = await g.solve(b.m, tol, maxIter); const gpuMs = performance.now() - t;
+  let d2 = 0, n2 = 0;
+  for (let i = 0; i < a.m.ndof; i++) { d2 += (a.m.u[i] - b.m.u[i]) ** 2; n2 += a.m.u[i] ** 2; }
+  const va = new Float64Array(a.m.ne), vb = new Float64Array(a.m.ne); a.m.vonMises(va); b.m.vonMises(vb);
+  let vmA = 0, vmB = 0; for (let e = 0; e < a.m.ne; e++) { vmA = Math.max(vmA, va[e]); vmB = Math.max(vmB, vb[e]); }
+  const bw = ny * a.h, dp = nz * a.h, I = bw * dp ** 3 / 12, E = 2e9, G = E / 2.6;
+  const theory = a.P * a.L ** 3 / (3 * E * I) + a.P * a.L / (5 / 6 * G * bw * dp);
+  const out = { ne: a.m.ne, cpu: ci, gpu: gi, trace: g.trace, cpuMs, gpuMs, setupMs, tipCpu: tipOf(a.m, a.tip), tipGpu: tipOf(b.m, b.tip), theory,
+    l2: Math.sqrt(d2 / n2), cCpu: a.m.compliance(), cGpu: b.m.compliance(), vmCpu: vmA, vmGpu: vmB, dispatches: g.dispatchesPerIteration, adapter: g.adapterName };
+  g.destroy();
+  return out;
+};
+
+// Time per conjugate gradient iteration on both solvers (fixed iteration counts).
+window.timing = async (nx, ny, nz, iters, cpuIters) => {
+  const a = build(nx, ny, nz, "beam"), b = build(nx, ny, nz, "beam");
+  let t = performance.now();
+  a.m.solve(0, cpuIters); const cpuMs = (performance.now() - t) / cpuIters;
+  const g = await GpuSolver.create(b.m);
+  g._setScale(b.m);
+  const rel = b.m.residual(b.m._r);
+  let rn = 0; for (let i = 0; i < b.m.ndof; i++) rn += b.m._r[i] ** 2; rn = Math.sqrt(rn);
+  for (let n = 0; n < g.nn; n++) for (let c = 0; c < 3; c++) g.cpu[4 * n + c] = b.m._r[3 * n + c] / rn;
+  await g._load(); await g._batch(2); // warm up (pipeline compilation)
+  await g._load();
+  t = performance.now();
+  for (let done = 0; done < iters; done += 8) await g._batch(8);
+  const gpuMs = (performance.now() - t) / (8 * Math.ceil(iters / 8));
+  // one CPU 64-bit residual, as used once per refinement step
+  t = performance.now(); a.m.residual(a.m._r); const residualMs = performance.now() - t;
+  const out = { ne: a.m.ne, nn: g.nn, cpuMsPerIter: cpuMs, gpuMsPerIter: gpuMs, residualMs, gpuBytes: g.bytes, rel };
+  g.destroy();
+  return out;
+};
+
+// Runs the real worker and records its messages (large arrays are summarised).
+window.runWorker = (msg) => new Promise((resolve, reject) => {
+  const w = new Worker(new URL("/src/fea/worker.js", import.meta.url), { type: "module" });
+  const log = [], t0 = performance.now();
+  let lastProgress = t0, maxGap = 0;
+  w.onerror = (e) => reject(new Error("worker error: " + e.message));
+  w.onmessage = (ev) => {
+    const m = ev.data, now = performance.now();
+    maxGap = Math.max(maxGap, now - lastProgress); lastProgress = now;
+    const row = { t: Math.round(now - t0) };
+    for (const [k, v] of Object.entries(m)) {
+      if (v && v.length !== undefined && typeof v !== "string") {
+        let s = 0; for (let i = 0; i < v.length; i++) s += v[i];
+        row[k] = { kind: v.constructor.name, length: v.length, sum: s };
+      } else row[k] = v;
+    }
+    log.push(row);
+    if (m.type === "done" || m.type === "analysis") { w.terminate(); resolve({ log, maxGapMs: maxGap, ms: now - t0 }); }
+  };
+  w.postMessage(msg);
+});
+// The size guard: a grid far beyond the device limits must give a clear Error.
+window.guard = async (nx, ny, nz) => { try { await GpuSolver.create({ nx, ny, nz }); return "no error"; } catch (e) { return e.message; } };
+window.ready = true;
+</script></body></html>
