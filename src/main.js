@@ -989,7 +989,7 @@ function wire() {
     else if (d.speed !== undefined) setPortRole(+d.speed, "feed", { speed: num });
     else if (d.spec !== undefined) setPortRole(+d.spec, "feed", { spec: t.value });
     else if (d.nozzle !== undefined) setPortRole(+d.nozzle, "feed", { nozzleArea: num * 1e-6 });
-    else if (d.punit !== undefined) { const p = portFor(openings[+d.punit]); setPortRole(+d.punit, "feed", { punit: t.value, pressure: p.pressure / (p.punit === "psi" ? PSI : BAR) * (t.value === "psi" ? PSI : BAR) }); }
+    else if (d.punit !== undefined) setPortRole(+d.punit, "feed", { punit: t.value }); // same pressure, shown in the other unit
     else if (d.pressure !== undefined) { const p = portFor(openings[+d.pressure]); setPortRole(+d.pressure, "feed", { pressure: num * (p.punit === "psi" ? PSI : BAR) }); }
   });
   $("portList").addEventListener("pointerover", (e) => {
