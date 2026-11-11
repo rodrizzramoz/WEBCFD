@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flowbench 3D CFD</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Saira+Semi+Condensed:wght@600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>Flowbench</h1>
+    <p>3D flow simulation in your browser. Load an STL, set the flow, press Run.</p>
+    <span class="chip" id="gpuChip">Checking GPU</span>
+  </header>
+
+  <div class="bench">
+    <aside>
+      <section class="card">
+        <h2><b>1</b>Model</h2>
+        <div class="field">
+          <label for="demo">Example models</label>
+          <select id="demo"></select>
+        </div>
+        <button type="button" class="btn" id="openBtn">Open STL file</button>
+        <input type="file" id="file" accept=".stl,model/stl" hidden>
+        <p class="small" id="modelInfo">You can also drop an STL onto the 3D view.</p>
+        <div class="two">
+          <div class="field">
+            <label for="unit">STL units</label>
+            <select id="unit">
+              <option value="0.001" selected>Millimetres</option>
+              <option value="0.01">Centimetres</option>
+              <option value="1">Metres</option>
+              <option value="0.0254">Inches</option>
+            </select>
+          </div>
+          <div class="field">
+            <span class="lbl">Rotate 90 deg about</span>
+            <div class="seg" id="rot">
+              <button type="button" data-axis="x">X</button>
+              <button type="button" data-axis="y">Y</button>
+              <button type="button" data-axis="z">Z</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2><b>2</b>Flow</h2>
+        <div class="seg wide" id="mode">
+          <button type="button" data-mode="external" aria-pressed="true">Around the part</button>
+          <button type="button" data-mode="internal" aria-pressed="false">Through the part</button>
+        </div>
+        <div class="two">
+          <div class="field">
+            <label for="fluid">Fluid</label>
+            <select id="fluid">
+              <option value="air">Air, 20 C</option>
+              <option value="water">Water, 20 C</option>
+              <option value="oil">Hydraulic oil, 40 C</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="speed" id="speedLabel">Wind speed, m/s</label>
+            <input type="number" id="speed" min="0.001" step="any" value="40">
+          </div>
+        </div>
+        <div class="two" id="customFluid" hidden>
+          <div class="field">
+            <label for="rho">Density, kg/m3</label>
+            <input type="number" id="rho" min="0.001" step="any" value="1.204">
+          </div>
+          <div class="field">
+            <label for="mu">Viscosity, Pa.s</label>
+            <input type="number" id="mu" min="0.0000001" step="any" value="0.00001825">
+          </div>
+        </div>
+        <div id="internalOpts" hidden>
+          <div class="two">
+            <div class="field">
+              <label for="inletFace">Inlet face</label>
+              <select id="inletFace"></select>
+            </div>
+            <div class="field">
+              <label for="outletFace">Outlet face</label>
+              <select id="outletFace"></select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="stlKind">The STL is</label>
+            <select id="stlKind">
+              <option value="solid">The solid part (flow goes through its holes)</option>
+              <option value="fluid">The fluid volume (the space the flow fills)</option>
+            </select>
+          </div>
+        </div>
+        <p class="small" id="flowHint">Flow runs along +X, from the green face to the orange face. Rotate the model to point it into the wind. Z is up.</p>
+      </section>
+
+      <section class="card">
+        <h2><b>3</b>Solve</h2>
+        <div class="two">
+          <div class="field">
+            <label for="res">Grid detail</label>
+            <select id="res">
+              <option value="64">Preview (64)</option>
+              <option value="96">Low (96)</option>
+              <option value="128" selected>Medium (128)</option>
+              <option value="192">High (192)</option>
+              <option value="256">Very high (256)</option>
+              <option value="320">Extreme (320)</option>
+            </select>
+          </div>
+          <div class="field" id="domainField">
+            <label for="domainScale">Space around part</label>
+            <select id="domainScale">
+              <option value="0.6">Tight</option>
+              <option value="1" selected>Standard</option>
+              <option value="1.5">Roomy</option>
+            </select>
+          </div>
+        </div>
+        <div class="two">
+          <button type="button" class="btn primary" id="runBtn">Run</button>
+          <button type="button" class="btn" id="restartBtn">Restart</button>
+        </div>
+        <dl class="facts" id="facts"></dl>
+      </section>
+
+      <section class="card">
+        <h2><b>4</b>Export</h2>
+        <div class="two">
+          <button type="button" class="btn" id="shotBtn">Screenshot</button>
+          <button type="button" class="btn" id="csvBtn">Results CSV</button>
+          <button type="button" class="btn" id="saveBtn">Save setup</button>
+          <button type="button" class="btn" id="loadBtn">Load setup</button>
+        </div>
+        <input type="file" id="setupFile" accept=".json,application/json" hidden>
+      </section>
+    </aside>
+
+    <div class="main">
+      <div class="toolbar">
+        <label class="check" for="showSlice"><input type="checkbox" id="showSlice" checked> Slice</label>
+        <div class="seg" id="sliceAxis">
+          <button type="button" data-axis="0" aria-pressed="false">X</button>
+          <button type="button" data-axis="1" aria-pressed="true">Y</button>
+          <button type="button" data-axis="2" aria-pressed="false">Z</button>
+        </div>
+        <input type="range" id="slicePos" min="0" max="1000" value="500" aria-label="Slice position">
+        <div class="seg" id="field">
+          <button type="button" data-field="speed" aria-pressed="true">Speed</button>
+          <button type="button" data-field="pressure" aria-pressed="false">Pressure</button>
+        </div>
+        <label class="check" for="showLines"><input type="checkbox" id="showLines" checked> Streamlines</label>
+        <label class="check" for="showSurf"><input type="checkbox" id="showSurf" checked> Surface pressure</label>
+        <label class="check" for="ghost"><input type="checkbox" id="ghost"> See-through model</label>
+        <label class="check" for="avg"><input type="checkbox" id="avg"> Time-averaged</label>
+      </div>
+
+      <div class="viewport" id="viewport">
+        <canvas id="view" tabindex="0" aria-label="3D view. Drag to orbit, scroll to zoom, right-drag to pan."></canvas>
+        <p id="notice" role="status"></p>
+        <div class="legends">
+          <div class="legend"><span>Speed</span><span id="spLo">0</span><i class="bar"></i><span id="spHi">-</span></div>
+          <div class="legend"><span>Pressure</span><span id="prLo">-</span><i class="bar"></i><span id="prHi">-</span></div>
+        </div>
+      </div>
+
+      <div class="status" id="status">Ready.</div>
+
+      <div class="readouts" id="tiles"></div>
+
+      <div class="chartbox">
+        <div class="head">
+          <span class="lbl">History over simulated time</span>
+          <span id="chartKey"></span>
+        </div>
+        <canvas id="chart" aria-label="Result history chart"></canvas>
+      </div>
+      <p class="small">Results are indicative. The solver is a lattice Boltzmann method on a uniform cell grid with a simple turbulence model and no wall functions, so treat numbers as comparisons between designs, and raise the grid detail until they stop changing.</p>
+    </div>
+  </div>
+</div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

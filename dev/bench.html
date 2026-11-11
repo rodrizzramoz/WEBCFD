@@ -1,0 +1,32 @@
+<!DOCTYPE html><html><body><script type="module">
+import * as THREE from "three";
+import { Solver } from "/src/solver.js";
+import { buildDomain } from "/src/domain.js";
+import { DEMOS } from "/src/demos.js";
+import { fieldStats, internalMetrics } from "/src/results.js";
+window.run = async (demo, res, nsteps, every, opts = {}) => {
+  const d = DEMOS[demo];
+  let g = d.build(); if (g.index) g = g.toNonIndexed(); g.scale(0.001, 0.001, 0.001);
+  const tris = g.getAttribute("position").array;
+  const o = { mode: d.setup.mode, res, domainScale: opts.domainScale || 1, inletFace: d.setup.inletFace, outletFace: d.setup.outletFace, stlIsFluid: d.setup.stlIsFluid };
+  const grid = buildDomain(tris, o);
+  const uLat = opts.uLat || Math.min(0.07, 0.11 / grid.speedUp), tau = opts.tau || 0.5001;
+  const lat = { uin: grid.inVec.map(c => c * uLat), tau, smag: 18 * Math.SQRT2 * 0.0144, initWithFlow: grid.mode === "external", rampSteps: grid.mode === "external" ? 0 : 20 * Math.max(grid.nx, grid.ny, grid.nz) };
+  const s = await Solver.create(); await s.setup(grid, lat);
+  const out = { dims: [grid.nx, grid.ny, grid.nz], speedUp: grid.speedUp, uLat, rows: [] };
+  let counts = [0,0,0,0,0]; for (const f of grid.flags) counts[f & 7]++;
+  out.counts = counts;
+  const A = grid.mode === "external" ? grid.frontalArea / grid.dx ** 2 : 0;
+  out.A = A;
+  for (let n = 0; n < nsteps; n += every) {
+    await s.step(every);
+    const r = await s.read();
+    const st = fieldStats(grid, r.macro);
+    if (grid.mode === "external") out.rows.push([s.steps, +(r.force[0] / (0.5 * uLat * uLat * A)).toFixed(3), +(r.force[2] / (0.5 * uLat * uLat * A)).toFixed(3), +st.vmax.toFixed(4), st.bad]);
+    else { const im = internalMetrics(grid, r.macro); out.rows.push([s.steps, +(im.dp / (0.5 * uLat * uLat)).toFixed(3), +(im.balance).toFixed(3), +st.vmax.toFixed(4), st.bad]); }
+    if (st.bad) break;
+  }
+  return out;
+};
+window.ready = true;
+</script></body></html>
