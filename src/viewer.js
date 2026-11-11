@@ -40,6 +40,10 @@ export class Viewer {
     this.lines.frustumCulled = false;
     this.scene.add(this.lines);
 
+    this.raycaster = new THREE.Raycaster();
+    this.box = null;
+    this.inletMesh = null;
+
     const loop = () => {
       this.resize();
       this.controls.update();
@@ -76,7 +80,10 @@ export class Viewer {
   setSurfaceColors(colors) {
     const g = this.model.geometry;
     if (colors) {
-      g.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      // Reuse the existing attribute where possible, so a new GPU buffer is not made on every update.
+      const old = g.getAttribute("color");
+      if (old && old.array.length === colors.length) { old.array.set(colors); old.needsUpdate = true; }
+      else g.setAttribute("color", new THREE.BufferAttribute(colors, 3));
       this.model.material = this.colorMat;
     } else {
       this.model.material = this.solidMat;
@@ -85,7 +92,12 @@ export class Viewer {
 
   // Draws the solver box, plus the inlet and outlet faces.
   setDomain(box, mode, inletFace, outletFace) {
+    for (const o of this.domain.children) {
+      if (o.dispose) o.dispose();
+      else { o.geometry.dispose(); o.material.dispose(); }
+    }
     this.domain.clear();
+    this.inletMesh = null;
     const size = box.dims.map((n) => n * box.dx);
     const c = box.origin.map((o, a) => o + size[a] / 2);
     const edges = new THREE.LineSegments(
@@ -106,6 +118,7 @@ export class Viewer {
       m.matrixAutoUpdate = false;
       m.matrix.makeBasis(new THREE.Vector3(...u), new THREE.Vector3(...v), new THREE.Vector3(...w)).setPosition(p[0], p[1], p[2]);
       this.domain.add(m);
+      if (color === 0x35c26b) this.inletMesh = m;
       const len = 0.18 * Math.max(...size);
       const n = NORMALS[f], dir = new THREE.Vector3(n[0], n[1], n[2]);
       const isInlet = color === 0x35c26b;
@@ -115,7 +128,7 @@ export class Viewer {
     };
     face(mode === "external" ? 0 : inletFace, 0x35c26b);
     face(mode === "external" ? 1 : outletFace, 0xf08a3c);
-    this.box = { c, size };
+    this.box = { c, size, origin: box.origin.slice() };
   }
 
   fit() {
@@ -139,7 +152,10 @@ export class Viewer {
       : axis === 1 ? [x0, p, z0, x1, p, z0, x1, p, z1, x0, p, z1]
       : [x0, y0, p, x1, y0, p, x1, y1, p, x0, y1, p];
     const g = this.slice.geometry;
-    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(corners), 3));
+    const posAttr = g.getAttribute("position");
+    if (posAttr) { posAttr.array.set(corners); posAttr.needsUpdate = true; }
+    else g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(corners), 3));
+    g.computeBoundingSphere(); // the raycaster (hover probe, smoke wand) needs current bounds
     if (!g.getAttribute("uv")) {
       g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]), 2));
       g.setIndex([0, 1, 2, 0, 2, 3]);
@@ -169,6 +185,56 @@ export class Viewer {
     this.lines.geometry.dispose();
     this.lines.geometry = g;
     this.lines.visible = true;
+  }
+
+  // Pointer position in client pixels to a ray from the camera.
+  aim(clientX, clientY) {
+    const r = this.canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    const ndc = new THREE.Vector2(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+    this.camera.updateMatrixWorld();
+    this.raycaster.setFromCamera(ndc, this.camera);
+    return true;
+  }
+
+  // World point [x, y, z] where the pointer meets the slice plane, or null.
+  pickSlice(clientX, clientY) {
+    if (!this.slice.visible || !this.slice.geometry.getAttribute("position")) return null;
+    if (!this.aim(clientX, clientY)) return null;
+    this.slice.updateMatrixWorld();
+    const hit = this.raycaster.intersectObject(this.slice, false)[0];
+    return hit ? [hit.point.x, hit.point.y, hit.point.z] : null;
+  }
+
+  // World point where the pointer meets the green inlet face, or null.
+  pickInlet(clientX, clientY) {
+    if (!this.inletMesh || !this.aim(clientX, clientY)) return null;
+    this.inletMesh.updateMatrixWorld(true);
+    const hit = this.raycaster.intersectObject(this.inletMesh, false)[0];
+    return hit ? [hit.point.x, hit.point.y, hit.point.z] : null;
+  }
+
+  // Index (0 to 5, numbered as in domain.js) of the domain box face under the pointer, or -1.
+  pickFace(clientX, clientY) {
+    if (!this.box || !this.aim(clientX, clientY)) return -1;
+    const { origin, size } = this.box;
+    const b = new THREE.Box3(new THREE.Vector3(origin[0], origin[1], origin[2]),
+      new THREE.Vector3(origin[0] + size[0], origin[1] + size[1], origin[2] + size[2]));
+    const p = this.raycaster.ray.intersectBox(b, new THREE.Vector3());
+    if (!p) return -1;
+    const q = [p.x, p.y, p.z];
+    let best = -1, bestD = Infinity;
+    for (let f = 0; f < 6; f++) {
+      const a = f >> 1, d = Math.abs(q[a] - (f & 1 ? origin[a] + size[a] : origin[a])) / Math.max(size[a], 1e-12);
+      if (d < bestD) { bestD = d; best = f; }
+    }
+    return best;
+  }
+
+  // Counts of live GPU resources, for leak checks.
+  resources() {
+    const m = this.renderer.info.memory;
+    return { geometries: m.geometries, textures: m.textures };
   }
 
   screenshot() {

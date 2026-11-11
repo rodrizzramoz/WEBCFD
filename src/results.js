@@ -10,6 +10,7 @@ for (let i = 0; i < 256; i++) {
 }
 export const LUT_CSS = "linear-gradient(to right, " + STOPS.map((c) => "rgb(" + c.join(",") + ")").join(", ") + ")";
 
+const WHITE = -1; // colour marker for smoke wand lines
 function lutIndex(v, lo, hi) {
   const t = (v - lo) / (hi - lo);
   return t <= 0 ? 0 : t >= 1 ? 255 : (t * 255) | 0;
@@ -57,6 +58,44 @@ export function sliceImage(grid, m, axis, index, field, lo, hi) {
   return { data: out, w, h };
 }
 
+// Speed and gauge pressure (lattice units) at the cell containing a world point.
+// Returns null outside the grid or inside a wall. "fix" optionally pins one axis to a cell layer.
+export function probe(grid, m, point, fixAxis = -1, fixIndex = 0) {
+  const { origin, dx, nx, ny, nz, flags } = grid, dims = [nx, ny, nz], ijk = [0, 0, 0];
+  for (let a = 0; a < 3; a++) {
+    ijk[a] = a === fixAxis ? fixIndex : Math.floor((point[a] - origin[a]) / dx);
+    if (ijk[a] < 0 || ijk[a] >= dims[a]) return null;
+  }
+  const c = ijk[0] + nx * (ijk[1] + ny * ijk[2]);
+  if ((flags[c] & 7) === SOLID) return null;
+  return { cell: c, ijk, speed: value(m, c, "speed"), pressure: value(m, c, "pressure") };
+}
+
+// A small ring of streamline seeds (grid coordinates) around a world point: one in the
+// middle and the rest on a circle about 2 cells across, square to the local flow.
+export function seedCluster(grid, m, point, count = 12) {
+  const { origin, dx } = grid;
+  const x = (point[0] - origin[0]) / dx, y = (point[1] - origin[1]) / dx, z = (point[2] - origin[2]) / dx;
+  const u = [0, 0, 0];
+  let d = grid.inVec;
+  if (m && sampleVelocity(grid, m, x, y, z, u)) {
+    const sp = Math.sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    if (sp > 1e-6) d = [u[0] / sp, u[1] / sp, u[2] / sp];
+  }
+  // two unit vectors square to d
+  const h = Math.abs(d[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  let e1 = [d[1] * h[2] - d[2] * h[1], d[2] * h[0] - d[0] * h[2], d[0] * h[1] - d[1] * h[0]];
+  const l1 = Math.hypot(e1[0], e1[1], e1[2]);
+  e1 = e1.map((v) => v / l1);
+  const e2 = [d[1] * e1[2] - d[2] * e1[1], d[2] * e1[0] - d[0] * e1[2], d[0] * e1[1] - d[1] * e1[0]];
+  const out = [x, y, z], R = 1.2, ring = count - 1;
+  for (let s = 0; s < ring; s++) {
+    const a = 2 * Math.PI * s / ring, ca = R * Math.cos(a), sa = R * Math.sin(a);
+    out.push(x + ca * e1[0] + sa * e2[0], y + ca * e1[1] + sa * e2[1], z + ca * e1[2] + sa * e2[2]);
+  }
+  return out;
+}
+
 function sampleVelocity(grid, m, x, y, z, out) {
   const { nx, ny, nz } = grid;
   const gx = x - 0.5, gy = y - 0.5, gz = z - 0.5;
@@ -100,8 +139,9 @@ export function makeSeeds(grid) {
 }
 
 // Integrates streamlines through the velocity field. Returns line-segment
-// vertex positions in metres and a colour per vertex.
-export function streamlines(grid, m, seeds, lo, hi) {
+// vertex positions in metres and a colour per vertex. Seeds from index "plainFrom"
+// onwards (smoke wand seeds) are drawn near white so they stand out from the rest.
+export function streamlines(grid, m, seeds, lo, hi, plainFrom = Infinity) {
   const { origin, dx, nx, flags } = grid;
   const maxSteps = Math.min(1500, Math.ceil((grid.nx + grid.ny + grid.nz) * 1.6));
   const pos = [], col = [];
@@ -116,11 +156,12 @@ export function streamlines(grid, m, seeds, lo, hi) {
       if (sp < 1e-6) break;
       const c = (x | 0) + nx * ((y | 0) + grid.ny * (z | 0));
       if ((flags[c] & 7) === SOLID) break;
-      const li = 3 * lutIndex(sp, lo, hi);
+      const li = s >= plainFrom ? WHITE : 3 * lutIndex(sp, lo, hi);
       const wx = origin[0] + x * dx, wy = origin[1] + y * dx, wz = origin[2] + z * dx;
       if (have) {
         pos.push(px, py, pz, wx, wy, wz);
-        col.push(LUT[pc] / 255, LUT[pc + 1] / 255, LUT[pc + 2] / 255, LUT[li] / 255, LUT[li + 1] / 255, LUT[li + 2] / 255);
+        if (pc === WHITE) col.push(0.96, 0.97, 1, 0.96, 0.97, 1);
+        else col.push(LUT[pc] / 255, LUT[pc + 1] / 255, LUT[pc + 2] / 255, LUT[li] / 255, LUT[li + 1] / 255, LUT[li + 2] / 255);
       }
       px = wx; py = wy; pz = wz; pc = li; have = true;
       // midpoint step

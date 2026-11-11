@@ -16,6 +16,7 @@ export const FACE_NAMES = ["X min", "X max", "Y min", "Y max", "Z min", "Z max"]
 // and inverted normals are both handled.
 export function voxelize(tris, origin, dx, nx, ny, nz) {
   const solid = new Uint8Array(nx * ny * nz);
+  let openColumns = 0, hitColumns = 0;
   const cols = new Array(ny * nz);
   const JY = 0.50137, JZ = 0.50071; // tiny offset so rays never run exactly along a mesh edge
   const oy = origin[1], oz = origin[2];
@@ -48,14 +49,25 @@ export function voxelize(tris, origin, dx, nx, ny, nz) {
     if (!hits) continue;
     const n = hits.length / 2;
     const order = Array.from({ length: n }, (_, i) => i).sort((p, q) => hits[2 * p] - hits[2 * q]);
+    // A closed surface is entered as often as it is left. If the total is not zero the
+    // mesh has a gap on this ray, so stop filling after the last crossing instead of
+    // drawing a solid streak all the way to the end of the grid.
+    let total = 0;
+    for (let i = 0; i < n; i++) total += hits[2 * i + 1];
+    hitColumns++;
+    if (total !== 0) openColumns++;
     let p = 0, wind = 0;
     const base = c * nx;
     for (let i = 0; i < nx; i++) {
       const xc = origin[0] + (i + 0.5) * dx;
       while (p < n && hits[2 * order[p]] < xc) { wind += hits[2 * order[p] + 1]; p++; }
+      if (p === n && total !== 0) break;
       if (wind !== 0) solid[base + i] = 1;
     }
   }
+  // Extra information for callers that want to warn about a mesh that is not watertight.
+  solid.openColumns = openColumns;
+  solid.hitColumns = hitColumns;
   return solid;
 }
 
@@ -119,6 +131,7 @@ function findOpenings(face, dims, isOpen, dropExterior) {
   const { cells, nu, nv } = layerCells(face, dims);
   const n = nu * nv;
   const open = new Uint8Array(n);
+  let outsideOnly = false;
   for (let m = 0; m < n; m++) open[m] = isOpen(cells[3 * m]) ? 1 : 0;
   if (dropExterior) {
     const ext = new Uint8Array(n), stack = [];
@@ -133,10 +146,12 @@ function findOpenings(face, dims, isOpen, dropExterior) {
     }
     let inner = 0;
     for (let m = 0; m < n; m++) if (open[m] && !ext[m]) inner++;
-    if (inner > 0) for (let m = 0; m < n; m++) if (ext[m]) open[m] = 0;
+    if (inner > 0) { for (let m = 0; m < n; m++) if (ext[m]) open[m] = 0; }
+    else outsideOnly = true;
   }
   const list = [];
   for (let m = 0; m < n; m++) if (open[m]) list.push(cells[3 * m]);
+  list.outsideOnly = outsideOnly && list.length > 0; // no enclosed port here, only the space around the part
   return list;
 }
 
@@ -146,6 +161,7 @@ export function buildDomain(tris, opt) {
   const raw = voxelize(tris, box.origin, dx, nx, ny, nz);
   const flags = new Uint32Array(n);
   const grid = { nx, ny, nz, n, dx, origin: box.origin, flags, bb: box.bb, mode: opt.mode };
+  grid.openColumns = raw.openColumns; grid.hitColumns = raw.hitColumns;
   const stride = [1, nx, nx * ny];
 
   if (opt.mode === "external") {
@@ -169,7 +185,11 @@ export function buildDomain(tris, opt) {
         for (let i = 1; i < nx - 1; i++) if (raw[base + i]) { frontal++; break; }
       }
     }
-    if (!solidCount) throw new Error("The model is smaller than one cell at this grid detail. Raise the grid detail or check the STL units.");
+    if (!solidCount) {
+      throw new Error(raw.openColumns > 0
+        ? "This STL has gaps in its surface (it is not watertight), so no solid shape could be built from it. Repair the mesh and load it again."
+        : "The model is smaller than one cell at this grid detail, or it is a flat surface with no thickness. Raise the grid detail, check the STL units, or use a closed solid.");
+    }
     grid.frontalArea = frontal * dx * dx;
     grid.refLength = box.bb.size[0];
     grid.inVec = [1, 0, 0];
@@ -229,5 +249,6 @@ export function buildDomain(tris, opt) {
   grid.inVec = NORMALS[opt.inletFace];
   grid.outNormal = NORMALS[opt.outletFace];
   grid.fluidCells = queue.length;
+  grid.portsOutside = [inOpen.outsideOnly ? opt.inletFace : -1, outOpen.outsideOnly ? opt.outletFace : -1].filter((f) => f >= 0);
   return grid;
 }

@@ -13,6 +13,10 @@
 <div class="page">
   <header>
     <h1>Flowbench</h1>
+    <nav class="nav" aria-label="Tools">
+      <a href="./index.html" aria-current="page">Flow</a>
+      <a href="./fea.html">Structure</a>
+    </nav>
     <p>3D flow simulation in your browser. Load an STL, set the flow, press Run.</p>
     <span class="chip" id="gpuChip">Checking GPU</span>
   </header>
@@ -70,6 +74,9 @@
             <input type="number" id="speed" min="0.001" step="any" value="40">
           </div>
         </div>
+        <div class="field">
+          <input type="range" id="speedSlider" min="0" max="1000" step="1" value="800" aria-label="Flow speed slider, changes the speed while the run carries on">
+        </div>
         <div class="two" id="customFluid" hidden>
           <div class="field">
             <label for="rho">Density, kg/m3</label>
@@ -98,6 +105,10 @@
               <option value="fluid">The fluid volume (the space the flow fills)</option>
             </select>
           </div>
+        </div>
+        <div class="field" id="yawField">
+          <label for="yaw">Yaw angle about Z: <output id="yawOut" for="yaw">0</output> deg</label>
+          <input type="range" id="yaw" min="-30" max="30" step="1" value="0">
         </div>
         <p class="small" id="flowHint">Flow runs along +X, from the green face to the orange face. Rotate the model to point it into the wind. Z is up.</p>
       </section>
@@ -161,16 +172,25 @@
         <label class="check" for="showSurf"><input type="checkbox" id="showSurf" checked> Surface pressure</label>
         <label class="check" for="ghost"><input type="checkbox" id="ghost"> See-through model</label>
         <label class="check" for="avg"><input type="checkbox" id="avg"> Time-averaged</label>
+        <button type="button" class="btn mini" id="clearSmoke">Clear smoke</button>
       </div>
 
       <div class="viewport" id="viewport">
         <canvas id="view" tabindex="0" aria-label="3D view. Drag to orbit, scroll to zoom, right-drag to pan."></canvas>
         <p id="notice" role="status"></p>
+        <div id="probe" hidden></div>
         <div class="legends">
           <div class="legend"><span>Speed</span><span id="spLo">0</span><i class="bar"></i><span id="spHi">-</span></div>
           <div class="legend"><span>Pressure</span><span id="prLo">-</span><i class="bar"></i><span id="prHi">-</span></div>
         </div>
       </div>
+
+      <div class="timeline">
+        <button type="button" class="btn mini" id="tlPlay">Play</button>
+        <input type="range" id="tlPos" min="0" max="0" step="1" value="0" aria-label="Replay position in the stored slice images">
+        <span class="status" id="tlLabel">Live. No slice images stored yet.</span>
+      </div>
+      <p class="small" id="viewHint">Hover over the slice to read speed and pressure at that point. Shift + click on the slice or on the green inlet face to release smoke there.</p>
 
       <div class="status" id="status">Ready.</div>
 

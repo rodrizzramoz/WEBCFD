@@ -222,6 +222,13 @@ export class Solver {
     }
   }
 
+  // Swaps in new lattice parameters (relaxation time tau, inlet velocity, turbulence constant)
+  // without reallocating anything, so a run carries on from its current flow state.
+  // They take effect on the next step, because step() writes them to the GPU each time.
+  updateLattice(lat) {
+    this.lat = lat;
+  }
+
   writeParams(ramp) {
     const g = this.grid, l = this.lat;
     const buf = new ArrayBuffer(48);
