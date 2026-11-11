@@ -203,15 +203,20 @@ export function surfaceColors(grid, m, positions, normals, lo, hi) {
 // Inlet-to-outlet pressure difference and the flow actually passing the
 // inlet and the outlet, in lattice units. "m" values are mass flow (density weighted).
 export function internalMetrics(grid, m) {
-  let pin = 0, pout = 0, qin = 0, qout = 0, min = 0, mout = 0;
+  let pin = 0, pout = 0, qin = 0, qout = 0, min = 0, mout = 0, tin = 0, tout = 0;
   const no = grid.outNormal, ni = grid.inVec;
   for (const c of grid.inletNbr) {
     const o = 4 * c, f = m[o + 1] * ni[0] + m[o + 2] * ni[1] + m[o + 3] * ni[2];
-    pin += (m[o] - 1) / 3; qin += f; min += f * m[o];
+    const p = (m[o] - 1) / 3, ke = 0.5 * m[o] * (m[o + 1] * m[o + 1] + m[o + 2] * m[o + 2] + m[o + 3] * m[o + 3]);
+    pin += p; qin += f; min += f * m[o]; tin += f * (p + ke);
   }
   for (const c of grid.outletNbr) {
     const o = 4 * c, f = -(m[o + 1] * no[0] + m[o + 2] * no[1] + m[o + 3] * no[2]);
-    pout += (m[o] - 1) / 3; qout += f; mout += f * m[o];
+    const p = (m[o] - 1) / 3, ke = 0.5 * m[o] * (m[o + 1] * m[o + 1] + m[o + 2] * m[o + 2] + m[o + 3] * m[o + 3]);
+    pout += p; qout += f; mout += f * m[o]; tout += f * (p + ke);
   }
-  return { dp: pin / grid.inletNbr.length - pout / grid.outletNbr.length, qin, qout, balance: min !== 0 ? mout / min : 0 };
+  // Total pressure (static plus kinetic), averaged by flow, is what is actually lost.
+  // Static drop alone also counts kinetic energy that is still in the jet at the outlet.
+  const loss = qin > 1e-12 && qout > 1e-12 ? tin / qin - tout / qout : 0;
+  return { dp: pin / grid.inletNbr.length - pout / grid.outletNbr.length, loss, qin, qout, balance: min !== 0 ? mout / min : 0 };
 }

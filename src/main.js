@@ -294,6 +294,11 @@ function showFacts(dims, dx, cells, l) {
     ["GPU memory", fmt(Solver.memoryBytes(cells) / 1048576) + " MB"],
   ];
   if (l) rows.push(["Time step", fmt(l.dt * 1e6) + " us"], ["Reynolds number", fmtBig(l.reynolds)]);
+  if (l && grid && grid.mode === "external") {
+    // share of the tunnel cross-section the part fills; above about 5 % it inflates drag
+    const b = 100 * grid.frontalArea / (dims[1] * dims[2] * dx * dx);
+    rows.push(["Blockage", fmt(b, 2) + " %" + (b > 6 ? " (high: use Roomy)" : "")]);
+  }
   $("facts").innerHTML = rows.map((r) => "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>").join("");
 }
 
@@ -426,7 +431,7 @@ function ingest(data) {
   } else {
     const im = internalMetrics(grid, data.macro);
     const toQ = lat.vel * grid.dx * grid.dx;
-    row = { t, dp: im.dp * lat.pres, q: im.qout * toQ, qin: im.qin * toQ, balance: im.balance, peak: st.vmax * lat.vel };
+    row = { t, loss: im.loss * lat.pres, dp: im.dp * lat.pres, q: im.qout * toQ, qin: im.qin * toQ, balance: im.balance, peak: st.vmax * lat.vel };
   }
   history.push(row);
   if (history.length > 4000) history.splice(0, 1000);
@@ -591,7 +596,7 @@ function renderTiles() {
     ["", "Side force", v("side", "N"), "sideways (+Y)"],
     ["", "Reynolds number", re, "based on model length"],
   ] : [
-    ["a", "Pressure drop", v("dp", "Pa"), "inlet minus outlet"],
+    ["a", "Pressure loss", v("loss", "Pa"), s ? "total pressure; static drop is " + fmt(s.dp) + " Pa" : "total pressure, inlet to outlet"],
     ["b", "Flow rate", s ? fmt(s.q * 60000) + " L/min" : "-", "leaving through the outlet"],
     ["", "Mean inlet speed", s && grid && prepared ? fmt(s.qin / grid.inletArea) + " m/s" : "-", "target " + fmt(state.speed) + " m/s"],
     ["", "Peak speed", v("peak", "m/s"), "fastest point in the flow"],
@@ -600,7 +605,7 @@ function renderTiles() {
   ];
   $("tiles").innerHTML = tiles.map((t) =>
     '<div class="tile ' + t[0] + '"><div class="lbl">' + t[1] + '</div><div class="value">' + t[2] + '</div><div class="sub">' + t[3] + "</div></div>").join("");
-  $("chartKey").innerHTML = (ext ? [["a", "Drag Cd"], ["b", "Lift Cl"]] : [["a", "Pressure drop, Pa"]])
+  $("chartKey").innerHTML = (ext ? [["a", "Drag Cd"], ["b", "Lift Cl"]] : [["a", "Total pressure loss, Pa"]])
     .map((k) => '<span class="key"><i style="background: var(--series-' + k[0] + ')"></i>' + k[1] + "</span>").join("");
 }
 
@@ -610,7 +615,7 @@ function drawChart() {
   if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   const g = c.getContext("2d"), cs = getComputedStyle(document.documentElement);
   g.clearRect(0, 0, w, h);
-  const keys = state.mode === "external" ? ["cd", "cl"] : ["dp"];
+  const keys = state.mode === "external" ? ["cd", "cl"] : ["loss"];
   const rows = history.length > 600 ? history.filter((_, i) => i % Math.ceil(history.length / 600) === 0) : history;
   let lo = 0, hi = 0;
   // ignore the start-up transient when scaling
@@ -873,7 +878,7 @@ function wire() {
   $("csvBtn").addEventListener("click", () => {
     if (!history.length) { notify("There are no results yet. Press Run first."); return; }
     const keys = Object.keys(history[0]);
-    const units = { t: "time_s", drag: "drag_N", side: "side_N", lift: "lift_N", cd: "Cd", cl: "Cl", dp: "pressure_drop_Pa", q: "flow_out_m3_per_s", qin: "flow_in_m3_per_s", balance: "mass_out_over_in", peak: "peak_speed_m_per_s" };
+    const units = { t: "time_s", drag: "drag_N", side: "side_N", lift: "lift_N", cd: "Cd", cl: "Cl", loss: "total_pressure_loss_Pa", dp: "static_pressure_drop_Pa", q: "flow_out_m3_per_s", qin: "flow_in_m3_per_s", balance: "mass_out_over_in", peak: "peak_speed_m_per_s" };
     const lines = [keys.map((k) => units[k] || k).join(",")].concat(history.map((r) => keys.map((k) => r[k]).join(",")));
     downloadText("flowbench-results.csv", lines.join("\n"), "text/csv");
   });
