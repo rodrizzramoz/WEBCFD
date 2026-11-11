@@ -99,6 +99,13 @@
       <section class="card">
         <h2><b>4</b>Analyse</h2>
         <div class="field">
+          <label for="meshType">Mesh type</label>
+          <select id="meshType">
+            <option value="tet" selected>Tetrahedra that follow the surface (accurate)</option>
+            <option value="cube">Cubes (fastest, uses the GPU on fine grids)</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="res">Grid detail (cells along the longest side)</label>
           <select id="res">
             <option value="24">Quick (24)</option>
@@ -113,7 +120,7 @@
         </div>
         <div class="two">
           <button type="button" class="btn" id="meshBtn" aria-pressed="false">Preview mesh</button>
-          <label class="check" for="meshEdges"><input type="checkbox" id="meshEdges" checked> Cell edges</label>
+          <label class="check" for="meshEdges"><input type="checkbox" id="meshEdges" checked> Element edges</label>
         </div>
         <button type="button" class="btn primary" id="analyseBtn">Run stress analysis</button>
         <dl class="facts" id="facts"></dl>
@@ -164,7 +171,7 @@
         </div>
         <span class="lbl">Shape</span>
         <div class="seg" id="viewMode">
-          <button type="button" data-v="blocks" aria-pressed="true">Blocks</button>
+          <button type="button" data-v="blocks" aria-pressed="true">Elements</button>
           <button type="button" data-v="smooth" aria-pressed="false">Smooth</button>
         </div>
         <label class="check" for="deform">Exaggerate bending <input type="range" id="deform" min="0" max="100" value="50"></label>
@@ -194,7 +201,7 @@
         </div>
         <canvas id="pareto" aria-label="Pareto chart of designs. Click a dot to show that design."></canvas>
       </div>
-      <p class="small">Linear elastic analysis on a grid of cube elements: small deflections, one uniform isotropic material, no buckling, fatigue or contact. Printed parts are weaker across their layers than the numbers here assume. Peak stress is the 99th percentile over the part, because single cells at sharp corners and at the load are not meaningful. Check any design you intend to rely on with a proper test.</p>
+      <p class="small">Linear elastic analysis on a mesh of four-node tetrahedra that follows the surface of the part (with strain smoothing, so bending is not too stiff), or on a grid of cube elements if you choose that mesh type: small deflections, one uniform isotropic material, no buckling, fatigue or contact. Printed parts are weaker across their layers than the numbers here assume. Peak stress is the 99th percentile over the part, because single elements at sharp corners and at the load are not meaningful. Check any design you intend to rely on with a proper test.</p>
     </div>
   </div>
 </div>

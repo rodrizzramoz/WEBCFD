@@ -2,6 +2,7 @@
 // picked faces onto voxels, result meshes, marching cubes and STL export.
 import { edgeTable, triTable } from "three/addons/objects/MarchingCubes.js";
 import { LUT } from "../results.js";
+import { TET_FACE } from "./tetmesh.js";
 
 // Triangle adjacency across shared edges, found by welding identical vertices.
 export function buildAdjacency(pos) {
@@ -140,6 +141,46 @@ export function voxelSkin(grid, cells, show, u, deform, values, lo, hi, rgb) {
     }
   }
   return { positions: new Float32Array(pos), colors: new Float32Array(col) };
+}
+
+// Outer skin of a tetrahedral mesh: every element face with no shown element
+// behind it. show: per element 0/1, or null for all. u: nodal displacements or
+// null. values: one per element, or one per node when nodal is true.
+// marks (optional): Map from element * 4 + face to an [r, g, b] colour.
+export function tetSkin(mesh, show, u, deform, values, lo, hi, marks, nodal) {
+  const { nodes, tets, nbr } = mesh, ne = tets.length / 4;
+  let count = 0;
+  for (let id = 0; id < 4 * ne; id++) if ((!show || show[id >> 2]) && (nbr[id] < 0 || (show && !show[nbr[id]]))) count++;
+  const pos = new Float32Array(9 * count), col = new Float32Array(9 * count);
+  const shade = (v, out, o) => {
+    const t = (v - lo) / (hi - lo || 1), l = 3 * (t <= 0 ? 0 : t >= 1 ? 255 : (t * 255) | 0);
+    out[o] = LUT[l] / 255; out[o + 1] = LUT[l + 1] / 255; out[o + 2] = LUT[l + 2] / 255;
+  };
+  let o = 0;
+  for (let id = 0; id < 4 * ne; id++) {
+    const e = id >> 2;
+    if ((show && !show[e]) || (nbr[id] >= 0 && (!show || show[nbr[id]]))) continue;
+    const f = TET_FACE[id & 3], mark = marks && marks.get(id);
+    for (let v = 0; v < 3; v++, o += 3) {
+      const n = tets[4 * e + f[v]];
+      pos[o] = nodes[3 * n] + (u ? u[3 * n] * deform : 0);
+      pos[o + 1] = nodes[3 * n + 1] + (u ? u[3 * n + 1] * deform : 0);
+      pos[o + 2] = nodes[3 * n + 2] + (u ? u[3 * n + 2] * deform : 0);
+      if (mark) { col[o] = mark[0]; col[o + 1] = mark[1]; col[o + 2] = mark[2]; }
+      else if (values) shade(values[nodal ? n : e], col, o);
+      else { col[o] = 0.72; col[o + 1] = 0.76; col[o + 2] = 0.8; }
+    }
+  }
+  return { positions: pos, colors: col, triangles: true };
+}
+
+// Fraction of every grid cell filled by a design on the tetrahedral mesh
+// (x = density per element, or null for the solid part). Feeds smoothSurface.
+export function tetDensity(mesh, x) {
+  const { nx, ny, nz, h } = mesh.grid, dens = new Float32Array(nx * ny * nz), h3 = h * h * h;
+  for (let e = 0; e < mesh.vol.length; e++) dens[mesh.cell[e]] += (x ? x[e] : 1) * mesh.vol[e] / h3;
+  for (let c = 0; c < dens.length; c++) if (dens[c] > 1) dens[c] = 1;
+  return dens;
 }
 
 // Smooth surface through a density field (one value per grid cell) at level 0.5.

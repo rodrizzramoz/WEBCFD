@@ -23,12 +23,13 @@
 A second page does stress analysis and shape optimisation on the same STL files.
 
 - **Supports and loads:** click faces on the model to mark them fixed or loaded (flat faces, or smooth curved surfaces such as bores). Forces are entered in newtons.
-- **Stress analysis:** linear elastic finite elements on a voxel grid (8-node brick per cell), solved matrix-free with a preconditioned conjugate gradient method in a Web Worker. Shows deflection, von Mises stress, safety factor and mass.
+- **Mesh type:** tetrahedra that follow the real surface (default), or cubes. The tetrahedral mesher needs no external library: it cuts a regular grid of tetrahedra against the exact surface, places nodes on the surface and on sharp edges, and gives a conforming mesh with the true volume. Cubes are faster and can use the GPU on fine grids, but round the part to whole cells.
+- **Stress analysis:** linear elastic finite elements, solved matrix-free with a preconditioned conjugate gradient method in a Web Worker. Tetrahedra use edge-based strain smoothing so that bending is not too stiff. Shows deflection, von Mises stress, safety factor and mass.
 - **Shape optimisation:** topology optimisation (SIMP material model, sensitivity filter, optimality criteria update). It removes material in 10 percent steps, re-analyses each step, and plots the trade-off between mass and stiffness. The lightest design that still meets your safety factor is highlighted, and any design can be exported as a smoothed STL.
 
-Checks: a 100 x 20 x 20 mm cantilever with an end load matches beam theory to within 2 to 5 percent for the geometry the grid actually represents (`src/fea/core.js` tested in Node). In the app the part is rounded to whole cells, so at 48 cells along the beam the section comes out 20.8 mm instead of 20 mm and the result is about 15 percent too stiff. Finer grids shrink that error.
+Checks (`node dev/fea-tet-check.mjs` and `node dev/fea-check.mjs`): on a 100 x 20 x 20 mm cantilever with an end load, where the grid does not line up with the part, the tetrahedral mesh has the right volume to 0.01 percent and a tip deflection 2.0 to 2.6 percent under beam theory at 24 to 72 cells along the beam. The cube mesh on the same grids is 8.5 percent over on volume and 16 to 19 percent too stiff. Sphere and cylinder volumes are within 0.3 percent at 32 cells; a plate with a through hole meshes conformingly with no inverted elements.
 
-Limits: small deflections, one isotropic material, no buckling, fatigue, contact or bolt preload. It runs on the CPU, so grids above roughly 50,000 elements are slow.
+Limits: small deflections, one isotropic material, no buckling, fatigue, contact or bolt preload. Tetrahedral meshes run on the CPU: analysis is quick up to several hundred thousand elements, optimisation is practical to about 100,000. Sharp edges that do not fall on the grid are bevelled by a fraction of a cell, and walls thinner than about one cell can be lost. The cube mesh has a GPU solver above 20,000 elements, checked only on a software-emulated GPU.
 
 See `docs/ACCURACY.md` for a researched review of how accurate the flow solver is and what would improve it.
 
@@ -70,7 +71,8 @@ Needs a browser with WebGPU: current Chrome, Edge, Firefox or Safari on a machin
 | `src/openfoam.js`, `src/foamrun.js` | OpenFOAM case writer and the client for the local runner. |
 | `server/flowbench_openfoam_server.py` | Optional local service that runs OpenFOAM for the page. |
 | `src/main.js` | UI, unit conversion, run loop, readouts, export. |
-| `src/fea/core.js` | Finite element solver and topology optimiser (no browser dependencies). |
+| `src/fea/tetmesh.js`, `src/fea/tetcore.js` | Body-fitted tetrahedral mesher, and the tetrahedral solver and optimiser. |
+| `src/fea/core.js`, `src/fea/gpu.js` | Cube-mesh solver and optimiser, and its WebGPU solver. |
 | `src/fea/worker.js` | Runs the solver off the main thread. |
 | `src/fea/mesh.js` | Face picking regions, mapping faces to voxels, result meshes, marching cubes, STL export. |
 | `src/fea/main.js`, `src/fea/view.js` | Structure page UI and 3D view. |

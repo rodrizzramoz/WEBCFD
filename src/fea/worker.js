@@ -7,7 +7,12 @@
 // solver is in use. It is sent once at the start, and once more only if the
 // GPU fails part way through a run and the CPU takes over. The page shows it
 // as: name (detail).
+//
+// A setup with kind "tet" is a mesh of tetrahedra that follows the real surface
+// (see tetmesh.js and tetcore.js). It always runs on the CPU. Every other setup
+// is the grid of cubes. Both use the same messages.
 import { Model, Optimiser } from "./core.js";
+import { TetModel, TetOptimiser } from "./tetcore.js";
 import { GpuSolver } from "./gpu.js";
 
 function percentile(values, keep, p) {
@@ -36,17 +41,20 @@ const GPU_MIN_ELEMENTS = 20000;
 
 self.onmessage = async (ev) => {
   const msg = ev.data;
-  const model = new Model(msg.setup);
+  const tet = msg.setup.kind === "tet";
+  const model = tet ? new TetModel(msg.setup) : new Model(msg.setup);
   const progress = (label) => (it, res) => self.postMessage({ type: "progress", label, it, res });
   const backend = (name, detail) => self.postMessage({ type: "backend", name, detail });
   // Test hooks, never sent by the page: msg.debug = { gpuMinElements, noGpu, failGpuSolve }
   // (failGpuSolve = number of the GPU solve that should fail, counted from 1).
   const debug = msg.debug || {};
-  const count = model.ne.toLocaleString("en-GB") + " elements";
+  const count = model.ne.toLocaleString("en-GB") + (tet ? " tetrahedral elements" : " elements");
 
   let gpu = null, gpuSolves = 0;
   const minElements = debug.gpuMinElements ?? GPU_MIN_ELEMENTS;
-  if (model.ne <= minElements) {
+  if (tet) {
+    backend("CPU", count + ", " + model.nn.toLocaleString("en-GB") + " nodes; this mesh type has no GPU solver");
+  } else if (model.ne <= minElements) {
     backend("CPU", count + ", small model");
   } else {
     try {
@@ -91,7 +99,7 @@ self.onmessage = async (ev) => {
     // Solid part first: the reference every lighter design is compared with.
     const info = await solve(1e-5, 12000, progress("Solving the solid part"));
     self.postMessage({ type: "stage", frac: 1, ...snapshot(model, null), iterations: info.iterations });
-    const opt = new Optimiser(model);
+    const opt = tet ? new TetOptimiser(model) : new Optimiser(model);
     for (const frac of msg.fractions) {
       let change = 1;
       for (let it = 0; it < msg.maxIter && change > 0.03; it++) {

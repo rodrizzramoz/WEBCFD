@@ -5,7 +5,8 @@ import { readModel, toGeometry, isCad, FORMATS_TEXT } from "../io.js";
 import { voxelize } from "../domain.js";
 import { LUT_CSS } from "../results.js";
 import { View } from "./view.js";
-import { buildAdjacency, growRegion, cellsUnderTriangles, cellNodes, voxelSkin, smoothSurface, toSTL } from "./mesh.js";
+import { buildAdjacency, growRegion, cellsUnderTriangles, cellNodes, voxelSkin, tetSkin, tetDensity, smoothSurface, toSTL } from "./mesh.js";
+import { buildTetMesh, gridFor, facesOnTriangles, connectedTo, filterMesh } from "./tetmesh.js";
 
 const $ = (id) => document.getElementById(id);
 // E in GPa, yield in MPa, density in kg/m3
@@ -20,8 +21,11 @@ const MATERIALS = {
   custom: ["Custom", 3.5, 0.36, 50, 1240],
 };
 
-const state = { unit: 0.001, res: 32, mat: "pla", E: 3.5e9, nu: 0.36, yield: 50e6, rho: 1240, colourBy: "stress", viewMode: "blocks" };
+const state = { unit: 0.001, res: 32, mat: "pla", E: 3.5e9, nu: 0.36, yield: 50e6, rho: 1240, colourBy: "stress", viewMode: "blocks", meshType: "tet", tetSmooth: true };
 let name = "", pos = null, adj = null, grid = null, cells = null;
+// Tetrahedral mesh of the current run (null when the cube mesh is in use), and
+// a one-entry cache so the preview and the run do not mesh the part twice.
+let tet = null, tetCache = null;
 let conds = [];          // {kind, tris, force}
 let tool = null;         // null, "fixed" or "load"
 let designs = [], sel = -1, live = null, recommended = -1;
@@ -173,7 +177,7 @@ function setTool(t) {
 // ---------- Setup for the solver ----------
 function invalidate() {
   stopWorker();
-  designs = []; sel = -1; live = null; recommended = -1; grid = null;
+  designs = []; sel = -1; live = null; recommended = -1; grid = null; tet = null;
   view.setResult(null); view.setSmooth(null); view.setModelStyle("solid");
   $("legendBox").hidden = true;
   $("design").disabled = true; $("design").max = 0;
@@ -188,28 +192,67 @@ function invalidate() {
 
 function showFacts() {
   const rows = [];
-  if (grid) rows.push(["Elements", String(cells.length)], ["Cell size", fmt(grid.h * 1000) + " mm"], ["Grid", grid.nx + " x " + grid.ny + " x " + grid.nz]);
+  if (grid && tet) rows.push(["Elements", tet.vol.length + " tetrahedra"], ["Nodes", String(tet.nodes.length / 3)], ["Element size", "about " + fmt(grid.h * 1000) + " mm"],
+    ["Lowest element quality", fmt(tet.quality.min, 2) + " (1 is ideal)"]);
+  else if (grid) rows.push(["Elements", String(cells.length)], ["Cell size", fmt(grid.h * 1000) + " mm"], ["Grid", grid.nx + " x " + grid.ny + " x " + grid.nz]);
   if (backend) rows.push(["Solver", backend]);
   $("facts").innerHTML = rows.map((r) => "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>").join("");
 }
 
 // Voxelises the part at the current grid detail.
 function buildGrid() {
-  let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
-  for (let i = 0; i < pos.length; i += 3) for (let a = 0; a < 3; a++) { min[a] = Math.min(min[a], pos[i + a]); max[a] = Math.max(max[a], pos[i + a]); }
-  const size = max.map((v, a) => v - min[a]), h = Math.max(...size) / state.res;
-  const origin = min.slice();
-  const dims = size.map((s) => Math.max(1, Math.ceil(s / h - 1e-6)));
-  const [nx, ny, nz] = dims;
-  const g = { nx, ny, nz, h, origin };
-  const solid = voxelize(pos, origin, h, nx, ny, nz);
+  const g = gridFor(pos, state.res), dims = [g.nx, g.ny, g.nz];
+  const solid = voxelize(pos, g.origin, g.h, g.nx, g.ny, g.nz);
   if (!solid.some((v) => v)) throw new Error("The part is thinner than one cell at this grid detail. Raise the grid detail or check the file units.");
   return { g, solid, dims };
+}
+
+// Meshes the part with tetrahedra at the current grid detail.
+function buildTets() {
+  if (tetCache && tetCache.pos === pos && tetCache.res === state.res) return tetCache.mesh;
+  const mesh = buildTetMesh(pos, gridFor(pos, state.res));
+  if (!mesh) throw new Error("The part is thinner than one element at this grid detail. Raise the grid detail or check the file units.");
+  tetCache = { pos, res: state.res, mesh };
+  return mesh;
+}
+
+// Supports and loads on the tetrahedral mesh. Each condition is a set of
+// triangles of the original surface; the mesh faces lying on them are found,
+// their nodes are fixed, or share the force in proportion to the face area
+// attached to each node (so a force on a face is an even pressure).
+function buildTetSetup() {
+  let mesh = buildTets();
+  const find = () => conds.map((c) => facesOnTriangles(mesh, pos, c.tris));
+  let found = find();
+  // keep only material connected to a support, otherwise loose pieces make the problem unsolvable
+  const seeds = [];
+  conds.forEach((c, n) => { if (c.kind === "fixed") for (const b of found[n].faces) seeds.push(mesh.bfaces[b] >> 2); });
+  if (!seeds.length) throw new Error("The fixed faces do not touch any material at this grid detail. Raise the grid detail.");
+  const reach = connectedTo(mesh, seeds);
+  if (reach.some((v) => !v)) { mesh = filterMesh(mesh, reach); found = find(); }
+  const nn = mesh.nodes.length / 3, ne = mesh.vol.length;
+  const fixed = new Uint8Array(nn), force = new Float64Array(3 * nn), marked = new Uint8Array(nn), passive = new Uint8Array(ne);
+  conds.forEach((c, n) => {
+    const f = found[n];
+    if (c.kind === "load" && !f.nodes.size) throw new Error("A loaded face is not connected to the supported part of the model. Check for loose pieces, or raise the grid detail.");
+    for (const [node, area] of f.nodes) {
+      marked[node] = 1;
+      if (c.kind === "fixed") fixed[node] = 1;
+      else for (let a = 0; a < 3; a++) force[3 * node + a] += c.force[a] * area / f.area;
+    }
+  });
+  for (let q = 0; q < mesh.tets.length; q++) if (marked[mesh.tets[q]]) passive[q >> 2] = 1;
+  tet = mesh; grid = mesh.grid; cells = { length: ne };
+  showFacts();
+  // state.tetSmooth = false (from the console, through window.flowfea.state) gives plain linear tetrahedra, for comparison
+  return { kind: "tet", nodes: mesh.nodes, tets: mesh.tets, fixed, force, passive, E: state.E, nu: state.nu, smooth: state.tetSmooth };
 }
 
 function buildSetup() {
   if (!conds.some((c) => c.kind === "fixed")) throw new Error("Mark at least one fixed face first, so the part is held somewhere.");
   if (!conds.some((c) => c.kind === "load" && Math.hypot(...c.force) > 0)) throw new Error("Mark at least one loaded face with a force that is not zero.");
+  if (state.meshType === "tet") return buildTetSetup();
+  tet = null;
   const { g, solid, dims } = buildGrid();
   const [nx, ny, nz] = dims, h = g.h;
   const condCells = conds.map((c) => cellsUnderTriangles(g, solid, pos, adj, c.tris));
@@ -247,10 +290,29 @@ function buildSetup() {
 }
 
 // ---------- Mesh preview ----------
-// Shows the brick elements the solver will use, with supported cells in green and loaded cells in orange.
+// Shows the elements the solver will use, with supported faces in green and loaded faces in orange.
 let previewOn = false;
+function showTetPreview() {
+  let mesh;
+  try { mesh = buildTets(); } catch (e) { notify(e.message, true); return; }
+  const ne = mesh.vol.length;
+  if (ne > 3e6) { notify("This mesh is too large to draw (" + ne + " elements). The solver can still try to run it."); return; }
+  const marks = new Map();
+  for (const c of conds) {
+    const col = c.kind === "fixed" ? [0.21, 0.76, 0.42] : [0.94, 0.54, 0.24];
+    for (const b of facesOnTriangles(mesh, pos, c.tris).faces) marks.set(mesh.bfaces[b], col);
+  }
+  const skin = tetSkin(mesh, null, null, 0, null, 0, 1, marks);
+  view.setSmooth(null); view.setResult(skin); view.setEdges($("meshEdges").checked ? skin : null);
+  view.setModelStyle("hidden"); $("legendBox").hidden = true;
+  const g = mesh.grid, thin = Math.min(g.nx, g.ny, g.nz);
+  $("status").textContent = "Mesh preview: " + ne + " tetrahedral elements, " + mesh.nodes.length / 3 + " nodes, element size about " + fmt(g.h * 1000) +
+    " mm, lowest element quality " + fmt(mesh.quality.min, 2) + " (1 is ideal, average " + fmt(mesh.quality.mean, 2) + "). " +
+    (thin < 4 ? "The part is under 4 elements thick in one direction, which is too coarse for bending. Raise the grid detail." : "Green faces are held, orange faces are loaded.");
+}
 function showPreview() {
   if (!previewOn || !pos) return;
+  if (state.meshType === "tet") { showTetPreview(); return; }
   let built;
   try { built = buildGrid(); } catch (e) { notify(e.message, true); return; }
   const { g, solid } = built, list = [];
@@ -294,11 +356,14 @@ function startWorker(message) {
 }
 
 function addDesign(m) {
-  let vol = 0;
-  if (m.x) for (let e = 0; e < m.x.length; e++) vol += m.x[e]; else vol = cells.length;
+  // vol = material volume in m3; elements of the tetrahedral mesh differ in size
+  let vol = 0, full = tet ? tet.volume : cells.length * grid.h ** 3;
+  if (!m.x) vol = full;
+  else if (tet) for (let e = 0; e < m.x.length; e++) vol += m.x[e] * tet.vol[e];
+  else { for (let e = 0; e < m.x.length; e++) vol += m.x[e]; vol *= grid.h ** 3; }
   const d = {
-    frac: vol / cells.length, x: m.x, u: m.u, vm: m.vm, compliance: m.compliance, maxDisp: m.maxDisp, peakStress: m.peakStress,
-    mass: state.rho * grid.h ** 3 * vol,
+    frac: vol / full, x: m.x, u: m.u, vm: m.vm, compliance: m.compliance, maxDisp: m.maxDisp, peakStress: m.peakStress,
+    mass: state.rho * vol,
   };
   designs.push(d);
   return d;
@@ -361,9 +426,24 @@ function showLive() {
   const show = new Uint8Array(cells.length);
   for (let e = 0; e < cells.length; e++) show[e] = live.x[e] > 0.5 ? 1 : 0;
   view.setSmooth(null);
-  view.setResult(voxelSkin(grid, cells, show, null, 0, live.x, -0.4, 1.2));
+  view.setResult(tet ? tetSkin(tet, show, null, 0, live.x, -0.4, 1.2) : voxelSkin(grid, cells, show, null, 0, live.x, -0.4, 1.2));
   view.setModelStyle($("showOrig").checked ? "ghost" : "hidden");
   $("legendBox").hidden = true;
+}
+
+// Smooth outer surface of a design, for the Smooth view and the STL export.
+// Tetrahedral mesh: the solid part is the boundary of the mesh itself, which
+// follows the real surface; an optimised design is first turned into the
+// fraction of every grid cell that is filled, then smoothed like the cube mesh.
+function designSurface(d) {
+  if (tet && !d.x) return tetSkin(tet, null, null, 0, null, 0, 1).positions;
+  let dens;
+  if (tet) dens = tetDensity(tet, d.x);
+  else {
+    dens = new Float32Array(grid.nx * grid.ny * grid.nz);
+    for (let e = 0; e < cells.length; e++) dens[cells[e]] = d.x ? d.x[e] : 1;
+  }
+  return smoothSurface(grid, dens).positions;
 }
 
 function showDesign(i) {
@@ -381,17 +461,20 @@ function showDesign(i) {
   for (let e = 0; e < ne; e++) show[e] = !d.x || d.x[e] > 0.5 ? 1 : 0;
   view.setModelStyle($("showOrig").checked ? "ghost" : "hidden");
   if (state.viewMode === "smooth") {
-    const dens = new Float32Array(grid.nx * grid.ny * grid.nz);
-    for (let e = 0; e < ne; e++) dens[cells[e]] = d.x ? d.x[e] : 1;
     view.setResult(null);
-    view.setSmooth(smoothSurface(grid, dens).positions);
+    view.setSmooth(designSurface(d));
     $("legendBox").hidden = true;
   } else {
     const model = view.size || 1;
     const deform = d.maxDisp > 0 ? (+$("deform").value / 100) * 0.12 * model / d.maxDisp : 0;
     let values = null, lo = 0, hi = 1;
     if (state.colourBy === "stress") { values = d.vm; hi = Math.max(d.peakStress * 1.05, 1e-9); }
-    else if (state.colourBy === "disp") {
+    else if (state.colourBy === "disp" && tet) {
+      // one value per node, so the colours blend across each face
+      values = new Float32Array(tet.nodes.length / 3);
+      for (let n = 0; n < values.length; n++) values[n] = Math.hypot(d.u[3 * n], d.u[3 * n + 1], d.u[3 * n + 2]);
+      hi = Math.max(d.maxDisp, 1e-12);
+    } else if (state.colourBy === "disp") {
       values = new Float32Array(ne);
       const NX = grid.nx + 1, NY = grid.ny + 1;
       for (let e = 0; e < ne; e++) {
@@ -401,7 +484,7 @@ function showDesign(i) {
       hi = Math.max(d.maxDisp, 1e-12);
     }
     view.setSmooth(null);
-    view.setResult(voxelSkin(grid, cells, show, d.u, deform, values, lo, hi));
+    view.setResult(tet ? tetSkin(tet, show, d.u, deform, values, lo, hi, null, state.colourBy === "disp") : voxelSkin(grid, cells, show, d.u, deform, values, lo, hi));
     $("legendBox").hidden = !values;
     if (values) {
       const stress = state.colourBy === "stress";
@@ -478,7 +561,8 @@ function run(kind) {
   $("notice").classList.remove("show");
   designs = []; sel = -1; recommended = -1;
   setPreview(false);
-  if (cells.length > 400000) notify("This grid has " + cells.length + " elements. That needs the GPU solver and may take a while; the Solver line under the button shows which solver is in use.");
+  if (tet && cells.length > 250000) notify("This mesh has " + cells.length + " tetrahedral elements. They are solved on the CPU only, so this may take several minutes. A coarser grid detail, or the cube mesh type with the GPU solver, is faster.");
+  else if (!tet && cells.length > 400000) notify("This grid has " + cells.length + " elements. That needs the GPU solver and may take a while; the Solver line under the button shows which solver is in use.");
   if (kind === "analyse") {
     stagesWanted = 1;
     $("status").textContent = "Solving...";
@@ -524,6 +608,7 @@ function wire() {
   };
   $("res").addEventListener("change", readRes);
   $("resCustom").addEventListener("change", readRes);
+  $("meshType").addEventListener("change", (e) => { state.meshType = e.target.value === "cube" ? "cube" : "tet"; invalidate(); });
   $("meshBtn").addEventListener("click", () => setPreview(!previewOn));
   $("meshEdges").addEventListener("change", () => { if (previewOn) showPreview(); });
   $("cadQuality").addEventListener("change", () => { if (lastFile) loadFile({ name: lastFile.name }, lastFile.buffer); });
@@ -595,10 +680,7 @@ function wire() {
   $("stlBtn").addEventListener("click", () => {
     const d = designs[sel];
     if (!d) { notify("There is no design to export yet. Run the analysis or the optimiser first."); return; }
-    const dens = new Float32Array(grid.nx * grid.ny * grid.nz);
-    for (let e = 0; e < cells.length; e++) dens[cells[e]] = d.x ? d.x[e] : 1;
-    const surf = smoothSurface(grid, dens);
-    download("flowbench-design-" + Math.round(d.frac * 100) + "pct.stl", new Blob([toSTL(surf.positions, 1 / state.unit)], { type: "model/stl" }));
+    download("flowbench-design-" + Math.round(d.frac * 100) + "pct.stl", new Blob([toSTL(designSurface(d), 1 / state.unit)], { type: "model/stl" }));
   });
   $("csvBtn").addEventListener("click", () => {
     if (!designs.length) { notify("There are no designs yet."); return; }
@@ -614,4 +696,4 @@ function wire() {
 
 wire();
 loadDemo("bracket");
-window.flowfea = { state, get designs() { return designs; }, get grid() { return grid; }, get conds() { return conds; }, run, loadDemo };
+window.flowfea = { state, get designs() { return designs; }, get grid() { return grid; }, get conds() { return conds; }, get mesh() { return tet; }, get elements() { return cells ? cells.length : 0; }, run, loadDemo };
