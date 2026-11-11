@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flowbench Structure</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Saira+Semi+Condensed:wght@600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>Flowbench</h1>
+    <nav class="nav" aria-label="Tools">
+      <a href="./index.html">Flow</a>
+      <a href="./fea.html" aria-current="page">Structure</a>
+    </nav>
+    <p>Stress analysis and shape optimisation. Load a part, mark where it is held and loaded, then let it find lighter shapes.</p>
+  </header>
+
+  <div class="bench">
+    <aside>
+      <section class="card">
+        <h2><b>1</b>Model</h2>
+        <div class="field">
+          <label for="demo">Example parts</label>
+          <select id="demo">
+            <option value="">Your own STL</option>
+            <option value="bracket">L bracket</option>
+            <option value="beam">Cantilever beam (theory check)</option>
+          </select>
+        </div>
+        <div class="two">
+          <button type="button" class="btn" id="openBtn">Open STL file</button>
+          <div class="field">
+            <select id="unit" aria-label="STL units">
+              <option value="0.001" selected>Millimetres</option>
+              <option value="0.01">Centimetres</option>
+              <option value="1">Metres</option>
+              <option value="0.0254">Inches</option>
+            </select>
+          </div>
+        </div>
+        <input type="file" id="file" accept=".stl,model/stl" hidden>
+        <p class="small" id="modelInfo">You can also drop an STL onto the 3D view.</p>
+      </section>
+
+      <section class="card">
+        <h2><b>2</b>Supports and loads</h2>
+        <div class="two">
+          <button type="button" class="btn" id="toolFixed" aria-pressed="false">Pick fixed faces</button>
+          <button type="button" class="btn" id="toolLoad" aria-pressed="false">Pick loaded faces</button>
+        </div>
+        <div class="field">
+          <label for="pickMode">A click selects</label>
+          <select id="pickMode">
+            <option value="flat">One flat face</option>
+            <option value="curved">A smooth curved surface (holes, fillets)</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="lbl">Force for the next loaded face, in newtons</span>
+          <div class="three">
+            <input type="number" id="fx" step="any" value="0" aria-label="Force X">
+            <input type="number" id="fy" step="any" value="0" aria-label="Force Y">
+            <input type="number" id="fz" step="any" value="-100" aria-label="Force Z">
+          </div>
+          <span class="small">X, Y, Z. Z is up, so -100 in Z pushes down with about 10 kg.</span>
+        </div>
+        <ul class="conds" id="conds"></ul>
+      </section>
+
+      <section class="card">
+        <h2><b>3</b>Material</h2>
+        <div class="field">
+          <select id="material" aria-label="Material"></select>
+        </div>
+        <div class="two" id="customMat" hidden>
+          <div class="field"><label for="matE">Stiffness E, GPa</label><input type="number" id="matE" step="any" min="0.001" value="3.5"></div>
+          <div class="field"><label for="matNu">Poisson ratio</label><input type="number" id="matNu" step="any" min="0" max="0.49" value="0.36"></div>
+          <div class="field"><label for="matY">Yield strength, MPa</label><input type="number" id="matY" step="any" min="0.001" value="50"></div>
+          <div class="field"><label for="matRho">Density, kg/m3</label><input type="number" id="matRho" step="any" min="1" value="1240"></div>
+        </div>
+        <p class="small" id="matInfo"></p>
+      </section>
+
+      <section class="card">
+        <h2><b>4</b>Analyse</h2>
+        <div class="field">
+          <label for="res">Grid detail (cells along the longest side)</label>
+          <select id="res">
+            <option value="24">Quick (24)</option>
+            <option value="32" selected>Normal (32)</option>
+            <option value="48">Fine (48)</option>
+            <option value="64">Very fine (64), slow</option>
+          </select>
+        </div>
+        <button type="button" class="btn primary" id="analyseBtn">Run stress analysis</button>
+        <dl class="facts" id="facts"></dl>
+      </section>
+
+      <section class="card">
+        <h2><b>5</b>Optimise the shape</h2>
+        <div class="two">
+          <div class="field">
+            <label for="minFrac">Lightest design to try</label>
+            <select id="minFrac">
+              <option value="0.5">Keep 50 %</option>
+              <option value="0.4">Keep 40 %</option>
+              <option value="0.3" selected>Keep 30 %</option>
+              <option value="0.2">Keep 20 %</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="targetSF">Safety factor needed</label>
+            <input type="number" id="targetSF" step="any" min="0.1" value="2">
+          </div>
+        </div>
+        <div class="two">
+          <button type="button" class="btn primary" id="optBtn">Find lighter designs</button>
+          <button type="button" class="btn" id="stopBtn" disabled>Stop</button>
+        </div>
+        <div class="progress"><i id="bar"></i></div>
+        <p class="small">It removes material in steps, keeping the load paths, and checks every step. Faces you marked always stay solid. The result is the trade-off between weight and stiffness, and the lightest design that still meets your safety factor.</p>
+      </section>
+
+      <section class="card">
+        <h2><b>6</b>Export</h2>
+        <div class="two">
+          <button type="button" class="btn" id="stlBtn">Selected design as STL</button>
+          <button type="button" class="btn" id="csvBtn">Designs CSV</button>
+          <button type="button" class="btn" id="shotBtn">Screenshot</button>
+        </div>
+      </section>
+    </aside>
+
+    <div class="main">
+      <div class="toolbar">
+        <span class="lbl">Colour by</span>
+        <div class="seg" id="colourBy">
+          <button type="button" data-v="stress" aria-pressed="true">Stress</button>
+          <button type="button" data-v="disp" aria-pressed="false">Movement</button>
+          <button type="button" data-v="plain" aria-pressed="false">Plain</button>
+        </div>
+        <span class="lbl">Shape</span>
+        <div class="seg" id="viewMode">
+          <button type="button" data-v="blocks" aria-pressed="true">Blocks</button>
+          <button type="button" data-v="smooth" aria-pressed="false">Smooth</button>
+        </div>
+        <label class="check" for="deform">Exaggerate bending <input type="range" id="deform" min="0" max="100" value="50"></label>
+        <label class="check" for="showOrig"><input type="checkbox" id="showOrig" checked> Outline of original</label>
+      </div>
+
+      <div class="viewport" id="viewport">
+        <canvas id="view" tabindex="0" aria-label="3D view. Drag to orbit, scroll to zoom, right-drag to pan."></canvas>
+        <p id="notice" role="status"></p>
+        <p class="tip" id="tip" hidden></p>
+        <div class="legends" id="legendBox" hidden>
+          <div class="legend"><span id="lgName">Stress</span><span id="lgLo">0</span><i class="bar"></i><span id="lgHi">-</span></div>
+        </div>
+      </div>
+
+      <div class="status" id="status">Ready.</div>
+      <div class="readouts" id="tiles"></div>
+
+      <div class="chartbox">
+        <div class="head">
+          <span class="lbl">Weight against stiffness: each dot is a design</span>
+          <span id="chartKey"></span>
+        </div>
+        <div id="designRow">
+          <span class="small" id="designLabel">No designs yet</span>
+          <input type="range" id="design" min="0" max="0" value="0" aria-label="Design to show" disabled>
+        </div>
+        <canvas id="pareto" aria-label="Pareto chart of designs. Click a dot to show that design."></canvas>
+      </div>
+      <p class="small">Linear elastic analysis on a grid of cube elements: small deflections, one uniform isotropic material, no buckling, fatigue or contact. Printed parts are weaker across their layers than the numbers here assume. Peak stress is the 99th percentile over the part, because single cells at sharp corners and at the load are not meaningful. Check any design you intend to rely on with a proper test.</p>
+    </div>
+  </div>
+</div>
+<script type="module" src="/src/fea/main.js"></script>
+</body>
+</html>

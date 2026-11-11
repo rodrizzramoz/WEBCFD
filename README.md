@@ -11,6 +11,20 @@
 - **Live 3D results while it solves:** slice plane (speed or pressure), streamlines, surface pressure, optional time averaging, and a history chart.
 - **Export:** screenshot (PNG), result history (CSV), setup (JSON, reloadable).
 
+## Structure page (fea.html)
+
+A second page does stress analysis and shape optimisation on the same STL files.
+
+- **Supports and loads:** click faces on the model to mark them fixed or loaded (flat faces, or smooth curved surfaces such as bores). Forces are entered in newtons.
+- **Stress analysis:** linear elastic finite elements on a voxel grid (8-node brick per cell), solved matrix-free with a preconditioned conjugate gradient method in a Web Worker. Shows deflection, von Mises stress, safety factor and mass.
+- **Shape optimisation:** topology optimisation (SIMP material model, sensitivity filter, optimality criteria update). It removes material in 10 percent steps, re-analyses each step, and plots the trade-off between mass and stiffness. The lightest design that still meets your safety factor is highlighted, and any design can be exported as a smoothed STL.
+
+Checks: a 100 x 20 x 20 mm cantilever with an end load matches beam theory to within 2 to 5 percent for the geometry the grid actually represents (`src/fea/core.js` tested in Node). In the app the part is rounded to whole cells, so at 48 cells along the beam the section comes out 20.8 mm instead of 20 mm and the result is about 15 percent too stiff. Finer grids shrink that error.
+
+Limits: small deflections, one isotropic material, no buckling, fatigue, contact or bolt preload. It runs on the CPU, so grids above roughly 50,000 elements are slow.
+
+See `docs/ACCURACY.md` for a researched review of how accurate the flow solver is and what would improve it.
+
 ## Run it
 
 ```
@@ -32,6 +46,10 @@ Needs a browser with WebGPU: current Chrome, Edge, Firefox or Safari on a machin
 | `src/results.js` | Slice images, streamlines, surface colours and internal flow metrics from the solver output. |
 | `src/viewer.js` | three.js scene. |
 | `src/main.js` | UI, unit conversion, run loop, readouts, export. |
+| `src/fea/core.js` | Finite element solver and topology optimiser (no browser dependencies). |
+| `src/fea/worker.js` | Runs the solver off the main thread. |
+| `src/fea/mesh.js` | Face picking regions, mapping faces to voxels, result meshes, marching cubes, STL export. |
+| `src/fea/main.js`, `src/fea/view.js` | Structure page UI and 3D view. |
 | `dev/bench.html` | Solver-only test page used for headless benchmarking. |
 
 ## Accuracy: read this before trusting a number
