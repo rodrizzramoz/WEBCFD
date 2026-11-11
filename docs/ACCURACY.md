@@ -233,3 +233,24 @@ Also opened, used for context only:
 - Flow force calculation in lattice Boltzmann method. https://arxiv.org/abs/2210.10377
 
 Not opened (cited by name only): Ahmed, Ramm and Faltin, SAE 840300 (1984); Lienhart and Becker, SAE 2003-01-0656; Meile et al. 2011; Achenbach 1972; Bouzidi, Firdaouss and Lallemand 2001; Mei, Luo and Shyy 1999; Ginzburg and d'Humieres 2003; Idelchik, Handbook of Hydraulic Resistance; Shah and London 1978; Hoerner, Fluid-Dynamic Drag; White, Fluid Mechanics; Durst et al. 2005.
+
+## Addendum: cross-checks run on 11 November 2026
+
+These were run after the review above, once OpenFOAM v1912 was available on the development machine. "Flowbench" is the in-browser lattice Boltzmann solver, in its two wall modes. "OpenFOAM" is the case this app exports (snappyHexMesh, simpleFoam, steady, k-omega SST where turbulent), solved on deliberately coarse meshes of similar cost. All Flowbench runs used the software-emulated GPU, so the grids are small.
+
+| Case | Flowbench, cube steps | Flowbench, true surface | OpenFOAM export | Reference |
+| --- | --- | --- | --- | --- |
+| Laminar pipe, developed pressure gradient, 16 cells across | 0.976 of theory | 1.023 of theory | not measured | 1.000 (Hagen-Poiseuille) |
+| Laminar pipe, inlet to outlet static drop in inlet dynamic pressures, Re 8 | 45.6 | 47.4 | 43.5 (7,552 cells) | about 46, with an uncertain entry-loss term |
+| Sphere drag coefficient, 10 cells across, Re 66,000 | 1.05 | 0.77 | not run | about 0.47 |
+| Cube drag coefficient, face on | 1.15 to 1.2 (12 cells across) | not run | 1.49, pressure part only (10 cells across, 5,584 cells) | about 1.05 |
+| Air mover demo, air drawn in per air fed | not run | about 0.6 to 0.85, fluctuating (jet 4 cells across, 24,000 steps) | 2.8 (6,221 cells), 3.2 (24,839 cells) | 2 to 3 from a momentum balance |
+
+What this shows:
+
+- **Pipe friction is fine in both wall modes** (within 2.5 percent). The earlier "12 percent high" figure was mostly my own underestimate of the laminar entry loss at very low Reynolds number, not a solver error.
+- **The true-surface wall option matters for curved bodies.** On the sphere it removed about half of the excess drag at the same grid. The rest is resolution and the missing wall model, as the review above explains.
+- **OpenFOAM is not automatically better at the same cost.** On the cube, a coarse steady RANS run was further from the reference than the browser solver.
+- **Jet-driven entrainment is where the browser solver is weakest at coarse grids.** With the nozzle only 4 cells across, the jet does not mix with the surrounding air quickly enough, and the predicted amplification is roughly a quarter of what OpenFOAM and a simple momentum balance give. This has not been tested at fine grids, where it should improve. Until it has been, use the OpenFOAM export or runner for air movers, ejectors and similar parts, and treat the browser result as a picture of the flow pattern.
+
+Not verified: any of these on a real GPU or at production grid sizes; the reporting block of the exported case (force coefficients and patch flow rates through OpenFOAM function objects), because function objects do not start in the Ubuntu v1912 package. The numbers above were computed from the written fields instead.

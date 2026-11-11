@@ -86,16 +86,7 @@ This is a fast, interactive solver, not a replacement for a validated CFD packag
 - The method is weakly compressible. The app keeps the fastest flow well below the lattice speed of sound, which is why internal flows with strong contractions take more steps.
 - STLs must be watertight with consistent normals. Walls thinner than one cell disappear.
 
-Checks run during development (solver-only page `dev/bench.html`, headless Chrome):
-
-| Case | Grid | Result | Reference |
-| --- | --- | --- | --- |
-| Laminar oil flow in a straight pipe, 16 cells across | 80 x 18 x 18 | pressure drop about 12 percent above theory, mass balance 100.0 percent | Hagen-Poiseuille plus entry loss |
-| Cube, face on, 12 cells across | 80 x 50 x 50 | Cd about 1.15 to 1.2 | about 1.05 |
-| Sphere, 22 cells across, tight domain | 96 x 63 x 63 | Cd about 0.93 | about 0.47 |
-| Venturi, 11 cells across the throat | 128 x 34 x 34 | pressure drop several times too high | a real venturi recovers most of its pressure |
-
-So sharp-edged shapes and simple ducts come out reasonably well, while smooth curved bodies and narrow throats need far finer grids than these before the numbers mean much.
+Checks run during development are tabulated at the end of `docs/ACCURACY.md`, including cross-checks against OpenFOAM. In short: pipe friction is within 2.5 percent, sharp-edged bodies are within about 15 percent, smooth curved bodies overpredict drag (less so with the true-surface wall option), and jet-driven entrainment is badly underpredicted on coarse grids, so use the OpenFOAM route for air movers and ejectors.
 
 ## Licence
 
