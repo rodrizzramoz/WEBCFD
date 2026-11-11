@@ -4,7 +4,11 @@
 
 ## What it does
 
-- **Models:** binary or ASCII STL, by file picker or drag and drop. Unit choice (mm, cm, m, inch) and 90 degree rotations. Four built-in examples.
+- **Models:** STEP, IGES and BREP CAD files (read with OpenCascade compiled to WebAssembly, loaded only when needed), plus STL, OBJ and 3MF meshes, by file picker or drag and drop. CAD files have a surface detail setting, and on the structure page their real CAD faces are what you click.
+- **Mesh preview:** both pages can show the exact cell model the solver will use before you run anything, with cell edges, a cell count, and a warning when the part is too coarse.
+- **Grid detail:** presets plus a custom value, up to whatever your GPU memory allows on the flow page.
+- **Interactive tools on the flow page:** hover probe on the slice, Shift + click smoke wand, live speed and fluid changes, click to pick inlet and outlet faces, yaw angle, replay timeline.
+- **Units and orientation:** unit choice (mm, cm, m, inch) and 90 degree rotations. Four built-in examples.
 - **Flow around a part (external):** the part sits in a virtual wind tunnel with flow along +X. Reports drag, lift and side force in newtons, plus Cd and Cl on the frontal area.
 - **Flow through a part (internal):** pick an inlet face and an outlet face of the bounding box. Reports pressure drop, flow rate, peak speed and mass balance. The STL can be the solid part (flow goes through its holes) or the fluid volume itself.
 - **Real units:** air, water, hydraulic oil or a custom fluid; speeds in m/s; results in N, Pa and L/min.
@@ -41,6 +45,7 @@ Needs a browser with WebGPU: current Chrome, Edge, Firefox or Safari on a machin
 
 | File | Job |
 | --- | --- |
+| `src/io.js` | Model import for both pages: STL, OBJ, 3MF, and STEP, IGES, BREP through occt-import-js. |
 | `src/domain.js` | Voxelises the STL (signed ray crossings along X) and builds the cell grid, including finding the inlet and outlet openings and flood-filling the fluid region for internal flow. |
 | `src/solver.js` | Lattice Boltzmann solver as a WebGPU compute shader: D3Q19 lattice, regularised BGK collision, Smagorinsky sub-grid turbulence model, halfway bounce-back walls, wall forces by momentum exchange. |
 | `src/results.js` | Slice images, streamlines, surface colours and internal flow metrics from the solver output. |

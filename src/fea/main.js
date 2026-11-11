@@ -1,7 +1,7 @@
 import "../style.css";
 import "./fea.css";
 import * as THREE from "three";
-import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { readModel, toGeometry, isCad, FORMATS_TEXT } from "../io.js";
 import { voxelize } from "../domain.js";
 import { LUT_CSS } from "../results.js";
 import { View } from "./view.js";
@@ -56,25 +56,35 @@ function press(container, value) {
 }
 
 // ---------- Model ----------
-function setSource(geometry, label, preset) {
-  let g = geometry.index ? geometry.toNonIndexed() : geometry.clone();
-  for (const a of Object.keys(g.attributes)) if (a !== "position") g.deleteAttribute(a);
+let srcPos = null, srcFaces = null, presetKey = "", faceTris = null, lastFile = null, backend = "";
+
+// positions: triangle soup in file units; faces: CAD face number per triangle, or null
+function setSource(positions, faces, label, key) {
+  srcPos = positions; srcFaces = faces; presetKey = key || "";
+  const g = toGeometry(Float32Array.from(positions));
   g.scale(state.unit, state.unit, state.unit);
   g.computeVertexNormals();
   g.computeBoundingBox();
   name = label;
   pos = g.getAttribute("position").array;
   adj = buildAdjacency(pos);
+  faceTris = null;
+  if (faces) {
+    faceTris = new Map();
+    for (let t = 0; t < faces.length; t++) { if (faces[t] < 0) continue; let l = faceTris.get(faces[t]); if (!l) faceTris.set(faces[t], l = []); l.push(t); }
+  }
+  const cadOpt = $("pickMode").querySelector('option[value="cad"]');
+  cadOpt.hidden = !faces;
+  $("pickMode").value = faces ? "cad" : "flat";
   view.setModel(g);
   conds = [];
-  if (preset) preset(g.boundingBox);
+  if (key) DEMOS[key].preset(g.boundingBox);
   const s = g.boundingBox.getSize(new THREE.Vector3());
-  $("modelInfo").textContent = label + ": " + (pos.length / 9) + " triangles, " + [s.x, s.y, s.z].map((v) => fmt(v * 1000)).join(" x ") + " mm. You can also drop an STL onto the 3D view.";
-  source = geometry;
+  $("modelInfo").textContent = label + ": " + (pos.length / 9) + " triangles" + (faces ? ", " + faceTris.size + " CAD faces" : "") + ", " +
+    [s.x, s.y, s.z].map((v) => fmt(v * 1000)).join(" x ") + " mm. Reads " + FORMATS_TEXT + "; you can also drop a file onto the 3D view.";
   invalidate();
   renderConds();
 }
-let source = null;
 
 // Selects every triangle that passes a test on its normal and centre point.
 function trisWhere(test) {
@@ -113,18 +123,28 @@ const DEMOS = {
 function loadDemo(key) {
   const d = DEMOS[key];
   state.unit = 0.001; $("unit").value = "0.001"; $("demo").value = key;
-  setSource(d.build(), d.label, d.preset);
+  lastFile = null; $("cadField").hidden = true;
+  let g = d.build();
+  if (g.index) g = g.toNonIndexed();
+  setSource(g.getAttribute("position").array, null, d.label, key);
 }
 
-async function loadFile(file) {
+async function loadFile(file, buffer) {
   try {
-    const geo = new STLLoader().parse(await file.arrayBuffer());
-    if (!geo.getAttribute("position") || geo.getAttribute("position").count < 3) throw new Error("empty");
+    $("status").textContent = (isCad(file.name) ? "Reading CAD geometry from " : "Reading ") + file.name + "...";
+    const buf = buffer || await file.arrayBuffer();
+    await new Promise((r) => setTimeout(r, 20));
+    const model = await readModel(file.name, buf, $("cadQuality").value);
+    for (let i = 0; i < model.positions.length; i++) if (!isFinite(model.positions[i])) throw new Error("it contains coordinates that are not numbers");
+    lastFile = model.cad ? { name: file.name, buffer: buf } : null;
+    $("cadField").hidden = !model.cad;
+    if (model.unit) { state.unit = model.unit; $("unit").value = String(model.unit); }
     $("demo").value = "";
-    setSource(geo, file.name, null);
-    notify("Loaded " + file.name + ". Now pick the faces that are held fixed and the faces that carry load.");
+    setSource(model.positions, model.faceIds, file.name, "");
+    notify("Loaded " + file.name + (model.cad ? " with " + model.faces + " CAD faces" : "") + ". Now pick the faces that are held fixed and the faces that carry load.");
   } catch (e) {
-    notify("That file could not be read as an STL. Export it again as a binary or ASCII STL.");
+    notify("That file could not be used: " + (e.message || "it could not be parsed") + ". Supported files are " + FORMATS_TEXT + ".");
+    $("status").textContent = "File not loaded.";
   }
 }
 
@@ -159,29 +179,39 @@ function invalidate() {
   $("design").disabled = true; $("design").max = 0;
   $("designLabel").textContent = "No designs yet";
   $("bar").style.width = "0";
+  backend = "";
   renderTiles(); drawPareto(); showFacts();
   $("status").textContent = "Ready. Run the stress analysis, or go straight to finding lighter designs.";
+  view.setEdges(null);
+  if (previewOn) showPreview();
 }
 
 function showFacts() {
   const rows = [];
   if (grid) rows.push(["Elements", String(cells.length)], ["Cell size", fmt(grid.h * 1000) + " mm"], ["Grid", grid.nx + " x " + grid.ny + " x " + grid.nz]);
+  if (backend) rows.push(["Solver", backend]);
   $("facts").innerHTML = rows.map((r) => "<dt>" + r[0] + "</dt><dd>" + r[1] + "</dd>").join("");
+}
+
+// Voxelises the part at the current grid detail.
+function buildGrid() {
+  let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < pos.length; i += 3) for (let a = 0; a < 3; a++) { min[a] = Math.min(min[a], pos[i + a]); max[a] = Math.max(max[a], pos[i + a]); }
+  const size = max.map((v, a) => v - min[a]), h = Math.max(...size) / state.res;
+  const origin = min.slice();
+  const dims = size.map((s) => Math.max(1, Math.ceil(s / h - 1e-6)));
+  const [nx, ny, nz] = dims;
+  const g = { nx, ny, nz, h, origin };
+  const solid = voxelize(pos, origin, h, nx, ny, nz);
+  if (!solid.some((v) => v)) throw new Error("The part is thinner than one cell at this grid detail. Raise the grid detail or check the file units.");
+  return { g, solid, dims };
 }
 
 function buildSetup() {
   if (!conds.some((c) => c.kind === "fixed")) throw new Error("Mark at least one fixed face first, so the part is held somewhere.");
   if (!conds.some((c) => c.kind === "load" && Math.hypot(...c.force) > 0)) throw new Error("Mark at least one loaded face with a force that is not zero.");
-  let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
-  for (let i = 0; i < pos.length; i += 3) for (let a = 0; a < 3; a++) { min[a] = Math.min(min[a], pos[i + a]); max[a] = Math.max(max[a], pos[i + a]); }
-  const size = max.map((v, a) => v - min[a]), h = Math.max(...size) / state.res;
-  const origin = min.map((v) => v - 0.01 * h);
-  const dims = size.map((s) => Math.max(1, Math.ceil(s / h + 0.02)));
-  const [nx, ny, nz] = dims;
-  const g = { nx, ny, nz, h, origin };
-  const solid = voxelize(pos, origin, h, nx, ny, nz);
-  if (!solid.some((v) => v)) throw new Error("The part is thinner than one cell at this grid detail. Raise the grid detail or check the STL units.");
-
+  const { g, solid, dims } = buildGrid();
+  const [nx, ny, nz] = dims, h = g.h;
   const condCells = conds.map((c) => cellsUnderTriangles(g, solid, pos, adj, c.tris));
   // keep only material connected to a support, otherwise loose pieces make the problem unsolvable
   const reach = new Uint8Array(solid.length), queue = [];
@@ -216,6 +246,36 @@ function buildSetup() {
   return { nx, ny, nz, h, solid: reach, fixed, force, passive, E: state.E, nu: state.nu };
 }
 
+// ---------- Mesh preview ----------
+// Shows the brick elements the solver will use, with supported cells in green and loaded cells in orange.
+let previewOn = false;
+function showPreview() {
+  if (!previewOn || !pos) return;
+  let built;
+  try { built = buildGrid(); } catch (e) { notify(e.message, true); return; }
+  const { g, solid } = built, list = [];
+  for (let c = 0; c < solid.length; c++) if (solid[c]) list.push(c);
+  if (list.length > 5e6) { notify("This mesh is too large to draw (" + list.length + " elements). The solver can still try to run it."); return; }
+  const cellArr = Int32Array.from(list), rgb = new Float32Array(list.length * 3).fill(-1);
+  const index = new Map(list.map((c, e) => [c, e]));
+  for (const c of conds) {
+    const col = c.kind === "fixed" ? [0.21, 0.76, 0.42] : [0.94, 0.54, 0.24];
+    for (const cell of cellsUnderTriangles(g, solid, pos, adj, c.tris).keys()) { const e = index.get(cell); if (e !== undefined) rgb.set(col, 3 * e); }
+  }
+  const skin = voxelSkin(g, cellArr, new Uint8Array(list.length).fill(1), null, 0, null, 0, 1, rgb);
+  view.setSmooth(null); view.setResult(skin); view.setEdges($("meshEdges").checked ? skin : null);
+  view.setModelStyle("hidden"); $("legendBox").hidden = true;
+  const thin = Math.min(g.nx, g.ny, g.nz);
+  $("status").textContent = "Mesh preview: " + list.length + " brick elements of " + fmt(g.h * 1000) + " mm, grid " + g.nx + " x " + g.ny + " x " + g.nz + ". " +
+    (thin < 4 ? "The part is under 4 elements thick in one direction, which is too coarse for bending. Raise the grid detail." : "Green cells are held, orange cells are loaded.");
+}
+function setPreview(on) {
+  previewOn = on;
+  $("meshBtn").setAttribute("aria-pressed", String(on));
+  if (on) { if (tool) setTool(tool); showPreview(); }
+  else { view.setEdges(null); if (designs.length) showDesign(-1); else { view.setResult(null); view.setModelStyle("solid"); } }
+}
+
 // ---------- Worker ----------
 function stopWorker() {
   if (worker) { worker.terminate(); worker = null; }
@@ -246,7 +306,9 @@ function addDesign(m) {
 
 function onWorker(ev) {
   const m = ev.data;
-  if (m.type === "progress") {
+  if (m.type === "backend") {
+    backend = m.name + (m.detail ? " (" + m.detail + ")" : ""); showFacts();
+  } else if (m.type === "progress") {
     $("status").textContent = m.label + ": solver pass " + m.it + ", remaining mismatch " + fmt(m.res, 2);
   } else if (m.type === "analysis") {
     designs = []; addDesign(m);
@@ -415,7 +477,8 @@ function run(kind) {
   try { setup = buildSetup(); } catch (e) { notify(e.message, true); return; }
   $("notice").classList.remove("show");
   designs = []; sel = -1; recommended = -1;
-  if (cells.length > 120000) notify("This grid has " + cells.length + " elements, which will be slow in the browser. Lower the grid detail if it takes too long.");
+  setPreview(false);
+  if (cells.length > 400000) notify("This grid has " + cells.length + " elements. That needs the GPU solver and may take a while; the Solver line under the button shows which solver is in use.");
   if (kind === "analyse") {
     stagesWanted = 1;
     $("status").textContent = "Solving...";
@@ -451,9 +514,19 @@ function wire() {
   vp.addEventListener("drop", (e) => { e.preventDefault(); vp.classList.remove("drop"); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
   $("unit").addEventListener("change", (e) => {
     state.unit = +e.target.value;
-    if (source) { const key = $("demo").value; setSource(source, name, key ? DEMOS[key].preset : null); }
+    if (srcPos) setSource(srcPos, srcFaces, name, presetKey);
   });
-  $("res").addEventListener("change", (e) => { state.res = +e.target.value; invalidate(); });
+  const readRes = () => {
+    const custom = $("res").value === "custom";
+    $("resCustom").hidden = !custom;
+    state.res = custom ? Math.max(8, Math.min(400, Math.round(+$("resCustom").value || 32))) : +$("res").value;
+    invalidate();
+  };
+  $("res").addEventListener("change", readRes);
+  $("resCustom").addEventListener("change", readRes);
+  $("meshBtn").addEventListener("click", () => setPreview(!previewOn));
+  $("meshEdges").addEventListener("change", () => { if (previewOn) showPreview(); });
+  $("cadQuality").addEventListener("change", () => { if (lastFile) loadFile({ name: lastFile.name }, lastFile.buffer); });
 
   $("toolFixed").addEventListener("click", () => setTool("fixed"));
   $("toolLoad").addEventListener("click", () => setTool("load"));
@@ -468,7 +541,11 @@ function wire() {
   const regionAt = (ev) => {
     const t = view.pick(ev);
     if (t < 0) return null;
-    if (t !== lastSeed) { lastSeed = t; lastRegion = growRegion(adj, t, $("pickMode").value); }
+    if (t !== lastSeed) {
+      lastSeed = t;
+      const mode = $("pickMode").value;
+      lastRegion = mode === "cad" && srcFaces && srcFaces[t] >= 0 ? Int32Array.from(faceTris.get(srcFaces[t])) : growRegion(adj, t, mode === "cad" ? "flat" : mode);
+    }
     return lastRegion;
   };
   $("pickMode").addEventListener("change", () => { lastSeed = -1; });

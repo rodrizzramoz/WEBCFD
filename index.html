@@ -17,7 +17,7 @@
       <a href="./index.html" aria-current="page">Flow</a>
       <a href="./fea.html">Structure</a>
     </nav>
-    <p>3D flow simulation in your browser. Load an STL, set the flow, press Run.</p>
+    <p>3D flow simulation in your browser. Load a CAD or mesh file, set the flow, press Run.</p>
     <span class="chip" id="gpuChip">Checking GPU</span>
   </header>
 
@@ -29,12 +29,21 @@
           <label for="demo">Example models</label>
           <select id="demo"></select>
         </div>
-        <button type="button" class="btn" id="openBtn">Open STL file</button>
-        <input type="file" id="file" accept=".stl,model/stl" hidden>
-        <p class="small" id="modelInfo">You can also drop an STL onto the 3D view.</p>
+        <button type="button" class="btn" id="openBtn">Open model file</button>
+        <input type="file" id="file" accept=".stl,.step,.stp,.iges,.igs,.brep,.obj,.3mf" hidden>
+        <div class="field" id="cadField" hidden>
+          <label for="cadQuality">CAD surface detail (how finely curves are faceted)</label>
+          <select id="cadQuality">
+            <option value="draft">Draft</option>
+            <option value="normal" selected>Normal</option>
+            <option value="fine">Fine</option>
+            <option value="ultra">Very fine</option>
+          </select>
+        </div>
+        <p class="small" id="modelInfo">Reads STL, STEP, IGES, BREP, OBJ and 3MF. You can also drop a file onto the 3D view.</p>
         <div class="two">
           <div class="field">
-            <label for="unit">STL units</label>
+            <label for="unit">File units</label>
             <select id="unit">
               <option value="0.001" selected>Millimetres</option>
               <option value="0.01">Centimetres</option>
@@ -99,7 +108,7 @@
             </div>
           </div>
           <div class="field">
-            <label for="stlKind">The STL is</label>
+            <label for="stlKind">The model is</label>
             <select id="stlKind">
               <option value="solid">The solid part (flow goes through its holes)</option>
               <option value="fluid">The fluid volume (the space the flow fills)</option>
@@ -125,7 +134,10 @@
               <option value="192">High (192)</option>
               <option value="256">Very high (256)</option>
               <option value="320">Extreme (320)</option>
+              <option value="448">Ultra (448)</option>
+              <option value="custom">Custom...</option>
             </select>
+            <input type="number" id="resCustom" min="32" max="1024" step="1" value="512" aria-label="Custom grid detail, cells along the longest side" hidden>
           </div>
           <div class="field" id="domainField">
             <label for="domainScale">Space around part</label>
@@ -137,6 +149,8 @@
           </div>
         </div>
         <div class="two">
+          <button type="button" class="btn" id="meshBtn" aria-pressed="false">Preview mesh</button>
+          <label class="check" for="meshEdges"><input type="checkbox" id="meshEdges" checked> Cell edges</label>
           <button type="button" class="btn primary" id="runBtn">Run</button>
           <button type="button" class="btn" id="restartBtn">Restart</button>
         </div>

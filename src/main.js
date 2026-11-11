@@ -1,6 +1,7 @@
 import "./style.css";
 import * as THREE from "three";
-import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { readModel, toGeometry, isCad, FORMATS_TEXT } from "./io.js";
+import { voxelSkin } from "./fea/mesh.js";
 import { Viewer } from "./viewer.js";
 import { Solver } from "./solver.js";
 import { DEMOS } from "./demos.js";
@@ -102,13 +103,14 @@ function bake(refit) {
   smoke = [];
   const s = g.boundingBox.getSize(new THREE.Vector3());
   $("modelInfo").textContent = state.name + ": " + fmtBig(tris.length / 9) + " triangles, " +
-    [s.x, s.y, s.z].map((v) => fmt(v * 1000)).join(" x ") + " mm. You can also drop an STL onto the 3D view.";
+    [s.x, s.y, s.z].map((v) => fmt(v * 1000)).join(" x ") + " mm. Reads " + FORMATS_TEXT + "; you can also drop a file onto the 3D view.";
   invalidate();
 }
 
 function loadDemo(key) {
   const d = DEMOS[key];
   Object.assign(state, d.setup, { demo: key });
+  lastFile = null; $("cadField").hidden = true;
   state.unit = 0.001;
   const f = FLUIDS[state.fluid];
   state.rho = f.rho; state.mu = f.mu;
@@ -163,31 +165,42 @@ function checkGeometry(geo) {
   if (Math.max(Math.abs(min[0]), Math.abs(min[1]), Math.abs(min[2]), Math.abs(max[0]), Math.abs(max[1]), Math.abs(max[2])) > 1e12) throw new Error("its coordinates are too large");
 }
 
-async function loadFile(file) {
-  let geo;
+// The last file opened, kept so a CAD file can be re-faceted at another detail level.
+let lastFile = null;
+
+async function loadFile(file, buffer) {
+  let geo, model;
+  const again = !!buffer;
   try {
-    if (!file.size) throw new Error("the file is empty");
-    $("status").textContent = "Reading " + file.name + "...";
-    const buf = await file.arrayBuffer();
+    if (!again && !file.size) throw new Error("the file is empty");
+    $("status").textContent = (isCad(file.name) ? "Reading CAD geometry from " : "Reading ") + file.name + "...";
+    const buf = buffer || await file.arrayBuffer();
     await new Promise((r) => setTimeout(r, 20)); // let the status line show before a long parse
-    try { geo = new STLLoader().parse(buf); }
-    catch (e) { throw new Error("it is not a valid binary or ASCII STL"); }
+    try { model = await readModel(file.name, buf, $("cadQuality").value); }
+    catch (e) { throw new Error(e.message || "it could not be parsed"); }
+    geo = toGeometry(model.positions);
     checkGeometry(geo);
+    lastFile = model.cad ? { name: file.name, buffer: buf } : null;
   } catch (e) {
-    notify("That file could not be used as an STL: " + e.message + ". Export it again as a binary or ASCII STL. The model that was open is unchanged.");
+    notify("That file could not be used: " + e.message + ". Supported files are " + FORMATS_TEXT + ". The model that was open is unchanged.");
     $("status").textContent = "File not loaded.";
     return;
   }
   try {
+    const keepRot = again ? rot.clone() : null;
+    if (model.unit) { state.unit = model.unit; $("unit").value = String(model.unit); }
+    $("cadField").hidden = !model.cad;
     setSource(geo, file.name);
+    if (keepRot) { rot.copy(keepRot); bake(false); }
     state.demo = "";
     $("demo").value = "";
     const gaps = openEdges(source.getAttribute("position").array);
+    const what = model.cad ? " (" + model.faces + " CAD faces, " + fmtBig(model.positions.length / 9) + " triangles)" : "";
     if (gaps > 0) {
-      notify("Loaded " + file.name + ", but its surface is not closed: " + fmtBig(gaps) + " open edges were found. The solver needs a watertight STL, so the shape it builds may be wrong. Repair the mesh if results look odd.", true);
-    } else notify("Loaded " + file.name + ". Check the units and the flow direction, then press Run.");
+      notify("Loaded " + file.name + what + ", but its surface is not closed: " + fmtBig(gaps) + " open edges were found. The solver needs a watertight shape, so the cell model it builds may be wrong. Use Preview mesh to check it.", true);
+    } else notify("Loaded " + file.name + what + ". Check the units and the flow direction, then press Run.");
   } catch (e) {
-    notify("That STL was read but could not be set up: " + e.message, true);
+    notify("That file was read but could not be set up: " + e.message, true);
   }
 }
 
@@ -233,6 +246,43 @@ function invalidate() {
   renderTiles();
   drawChart();
   $("status").textContent = "Setup changed. Press Run to solve.";
+  if (previewOn) { clearTimeout(previewTimer); previewTimer = setTimeout(showPreview, 200); }
+}
+
+// ---------- Mesh preview ----------
+// Shows the cell model the solver will actually use, before any solving.
+let previewOn = false, previewTimer = 0;
+function showPreview() {
+  if (!previewOn || !tris) return;
+  let g;
+  try { g = buildDomain(tris, options()); }
+  catch (e) { viewer.setPreview(null); notify(e.message, true); return; }
+  const want = g.mode === "external" ? 1 : 0; // show the solid part, or the fluid region for internal flow
+  const cells = [];
+  for (let c = 0; c < g.n; c++) {
+    const t = g.flags[c] & 7;
+    if (t === want || (want === 0 && t >= 3)) cells.push(c);
+  }
+  if (cells.length > 6e6) { viewer.setPreview(null); notify("This cell model is too large to draw (" + fmtBig(cells.length) + " cells). The solver can still run it."); return; }
+  const cellArr = Int32Array.from(cells), show = new Uint8Array(cells.length).fill(1);
+  let values = null;
+  if (want === 0) { values = new Float32Array(cells.length); for (let e = 0; e < cells.length; e++) { const t = g.flags[cells[e]] & 7; values[e] = t === 3 ? 0.55 : t === 4 ? 0.85 : 0.25; } }
+  const skin = voxelSkin({ nx: g.nx, ny: g.ny, nz: g.nz, h: g.dx, origin: g.origin }, cellArr, show, null, 0, values, 0, 1);
+  viewer.setPreview(skin, $("meshEdges").checked && skin.positions.length < 3e7);
+  const s = g.bb.size.map((v) => Math.max(1, Math.round(v / g.dx)));
+  $("status").textContent = "Mesh preview: " + fmtBig(cells.length) + (want ? " solid cells, the part is " : " fluid cells, the part is ") + s.join(" x ") + " cells. " +
+    (Math.min(...s) < 8 ? "That is coarse: fewer than 8 cells across the thinnest direction. Raise the grid detail for usable numbers." : "Press Run to solve.");
+}
+function setPreview(on) {
+  previewOn = on;
+  $("meshBtn").setAttribute("aria-pressed", String(on));
+  if (on) showPreview(); else viewer.setPreview(null);
+}
+
+function partCells(dx) {
+  const b = baked && baked.boundingBox;
+  if (!b) return "-";
+  return [b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z].map((v) => Math.max(1, Math.round(v / dx))).join(" x ");
 }
 
 function showFacts(dims, dx, cells, l) {
@@ -240,6 +290,7 @@ function showFacts(dims, dx, cells, l) {
     ["Grid", dims.join(" x ")],
     ["Cells", fmtBig(cells)],
     ["Cell size", fmt(dx * 1000) + " mm"],
+    ["Part size in cells", tris ? partCells(dx) : "-"],
     ["GPU memory", fmt(Solver.memoryBytes(cells) / 1048576) + " MB"],
   ];
   if (l) rows.push(["Time step", fmt(l.dt * 1e6) + " us"], ["Reynolds number", fmtBig(l.reynolds)]);
@@ -609,7 +660,12 @@ function syncInputs(keepGhost) {
   $("yaw").value = String(state.yaw); $("yawOut").textContent = String(state.yaw);
   $("slicePos").value = String(Math.round(state.slicePos * 1000));
   $("rho").value = state.rho; $("mu").value = state.mu;
-  $("res").value = String(state.res);
+  {
+    const preset = [...$("res").options].some((o) => o.value === String(state.res));
+    $("res").value = preset ? String(state.res) : "custom";
+    $("resCustom").hidden = preset;
+    if (!preset) $("resCustom").value = state.res;
+  }
   $("domainScale").value = String(state.domainScale);
   $("inletFace").value = String(state.inletFace);
   $("outletFace").value = String(state.outletFace);
@@ -638,6 +694,7 @@ async function toggleRun(keepNotice) {
   try {
     if (running) { await stopLoop(); $("runBtn").textContent = "Run"; return; }
     await stopLoop();
+    if (previewOn) setPreview(false);
     let warning = "";
     if (!prepared) {
       $("status").textContent = "Building the cell grid...";
@@ -674,7 +731,7 @@ function cleanSetup(s) {
   oneOf("unit", optionValues("unit"));
   oneOf("mode", ["external", "internal"]);
   oneOf("fluid", ["air", "water", "oil", "custom"]);
-  oneOf("res", optionValues("res"));
+  number("res", 32, 1024);
   oneOf("domainScale", optionValues("domainScale"));
   oneOf("inletFace", [0, 1, 2, 3, 4, 5]); oneOf("outletFace", [0, 1, 2, 3, 4, 5]);
   oneOf("stlIsFluid", [true, false]);
@@ -690,7 +747,7 @@ function cleanSetup(s) {
 }
 
 function wire() {
-  $("demo").innerHTML = '<option value="">Your own STL</option>' +
+  $("demo").innerHTML = '<option value="">Your own file</option>' +
     Object.entries(DEMOS).map(([k, d]) => '<option value="' + k + '">' + d.label + "</option>").join("");
   const faces = FACE_NAMES.map((n, i) => '<option value="' + i + '">' + n + "</option>").join("");
   $("inletFace").innerHTML = faces; $("outletFace").innerHTML = faces;
@@ -743,7 +800,18 @@ function wire() {
     bake(false);
   });
   const sel = (id, key, conv = Number) => $(id).addEventListener("change", (e) => { state[key] = conv(e.target.value); invalidate(); });
-  sel("res", "res"); sel("domainScale", "domainScale"); sel("inletFace", "inletFace"); sel("outletFace", "outletFace");
+  const readRes = () => {
+    const custom = $("res").value === "custom";
+    $("resCustom").hidden = !custom;
+    state.res = custom ? Math.max(32, Math.min(1024, Math.round(+$("resCustom").value || 128))) : +$("res").value;
+    invalidate();
+  };
+  $("res").addEventListener("change", readRes);
+  $("resCustom").addEventListener("change", readRes);
+  $("meshBtn").addEventListener("click", () => setPreview(!previewOn));
+  $("meshEdges").addEventListener("change", () => { if (previewOn) showPreview(); });
+  $("cadQuality").addEventListener("change", () => { if (lastFile) loadFile({ name: lastFile.name }, lastFile.buffer); });
+  sel("domainScale", "domainScale"); sel("inletFace", "inletFace"); sel("outletFace", "outletFace");
   sel("stlKind", "stlIsFluid", (v) => v === "fluid");
 
   $("runBtn").addEventListener("click", () => toggleRun());

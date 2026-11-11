@@ -113,7 +113,8 @@ const FACES = [ // neighbour offset, then the four corner offsets (anticlockwise
 
 // Outer skin of the voxel model, optionally deformed and coloured by a per-element value.
 // cells: grid cell index of each element; show: per element 0/1; u: nodal displacements or null.
-export function voxelSkin(grid, cells, show, u, deform, values, lo, hi) {
+// rgb (optional): Float32Array with 3 numbers per element; a negative red means no override.
+export function voxelSkin(grid, cells, show, u, deform, values, lo, hi, rgb) {
   const { nx, ny, nz, h, origin } = grid, NX = nx + 1, NY = ny + 1;
   const elemOf = new Int32Array(nx * ny * nz).fill(-1);
   for (let e = 0; e < cells.length; e++) if (show[e]) elemOf[cells[e]] = e;
@@ -131,6 +132,7 @@ export function voxelSkin(grid, cells, show, u, deform, values, lo, hi) {
       const t = (values[e] - lo) / (hi - lo || 1), l = 3 * (t <= 0 ? 0 : t >= 1 ? 255 : (t * 255) | 0);
       r = LUT[l] / 255; g = LUT[l + 1] / 255; b = LUT[l + 2] / 255;
     }
+    if (rgb && rgb[3 * e] >= 0) { r = rgb[3 * e]; g = rgb[3 * e + 1]; b = rgb[3 * e + 2]; }
     for (const f of FACES) {
       const a = i + f[0][0], bb = j + f[0][1], cc = k + f[0][2];
       if (a >= 0 && bb >= 0 && cc >= 0 && a < nx && bb < ny && cc < nz && elemOf[a + nx * (bb + ny * cc)] >= 0) continue;

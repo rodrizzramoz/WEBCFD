@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "occt-import-js": "^0.0.23",
     "three": "^0.170.0"
   },
   "devDependencies": {

@@ -27,15 +27,15 @@
         <div class="field">
           <label for="demo">Example parts</label>
           <select id="demo">
-            <option value="">Your own STL</option>
+            <option value="">Your own file</option>
             <option value="bracket">L bracket</option>
             <option value="beam">Cantilever beam (theory check)</option>
           </select>
         </div>
         <div class="two">
-          <button type="button" class="btn" id="openBtn">Open STL file</button>
+          <button type="button" class="btn" id="openBtn">Open model file</button>
           <div class="field">
-            <select id="unit" aria-label="STL units">
+            <select id="unit" aria-label="File units">
               <option value="0.001" selected>Millimetres</option>
               <option value="0.01">Centimetres</option>
               <option value="1">Metres</option>
@@ -43,8 +43,17 @@
             </select>
           </div>
         </div>
-        <input type="file" id="file" accept=".stl,model/stl" hidden>
-        <p class="small" id="modelInfo">You can also drop an STL onto the 3D view.</p>
+        <input type="file" id="file" accept=".stl,.step,.stp,.iges,.igs,.brep,.obj,.3mf" hidden>
+        <div class="field" id="cadField" hidden>
+          <label for="cadQuality">CAD surface detail (how finely curves are faceted)</label>
+          <select id="cadQuality">
+            <option value="draft">Draft</option>
+            <option value="normal" selected>Normal</option>
+            <option value="fine">Fine</option>
+            <option value="ultra">Very fine</option>
+          </select>
+        </div>
+        <p class="small" id="modelInfo">Reads STL, STEP, IGES, BREP, OBJ and 3MF. You can also drop a file onto the 3D view.</p>
       </section>
 
       <section class="card">
@@ -56,6 +65,7 @@
         <div class="field">
           <label for="pickMode">A click selects</label>
           <select id="pickMode">
+            <option value="cad" hidden>One CAD face (from the STEP, IGES or BREP file)</option>
             <option value="flat">One flat face</option>
             <option value="curved">A smooth curved surface (holes, fillets)</option>
           </select>
@@ -94,8 +104,16 @@
             <option value="24">Quick (24)</option>
             <option value="32" selected>Normal (32)</option>
             <option value="48">Fine (48)</option>
-            <option value="64">Very fine (64), slow</option>
+            <option value="64">Very fine (64)</option>
+            <option value="96">Extra fine (96)</option>
+            <option value="128">Ultra (128)</option>
+            <option value="custom">Custom...</option>
           </select>
+          <input type="number" id="resCustom" min="8" max="400" step="1" value="160" aria-label="Custom grid detail, cells along the longest side" hidden>
+        </div>
+        <div class="two">
+          <button type="button" class="btn" id="meshBtn" aria-pressed="false">Preview mesh</button>
+          <label class="check" for="meshEdges"><input type="checkbox" id="meshEdges" checked> Cell edges</label>
         </div>
         <button type="button" class="btn primary" id="analyseBtn">Run stress analysis</button>
         <dl class="facts" id="facts"></dl>

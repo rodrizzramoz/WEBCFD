@@ -142,6 +142,25 @@ export class View {
     this.result.visible = true;
   }
 
+  // Draws black cell edges over the result mesh (each cell face is two triangles: corners 0, 1, 2, 5).
+  setEdges(skin) {
+    if (!this.edges) {
+      this.edges = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0b0f16, transparent: true, opacity: 0.55 }));
+      this.scene.add(this.edges);
+      this.result.material.polygonOffset = true; this.result.material.polygonOffsetFactor = 1; this.result.material.polygonOffsetUnits = 1;
+    }
+    this.edges.geometry.dispose();
+    this.edges.geometry = new THREE.BufferGeometry();
+    this.edges.visible = !!(skin && skin.positions.length);
+    if (!this.edges.visible) return;
+    const p = skin.positions, quads = p.length / 18, e = new Float32Array(quads * 24), order = [0, 1, 1, 2, 2, 5, 5, 0];
+    for (let q = 0; q < quads; q++) for (let k = 0; k < 8; k++) {
+      const src = 18 * q + 3 * order[k], dst = 24 * q + 3 * k;
+      e[dst] = p[src]; e[dst + 1] = p[src + 1]; e[dst + 2] = p[src + 2];
+    }
+    this.edges.geometry.setAttribute("position", new THREE.BufferAttribute(e, 3));
+  }
+
   setSmooth(positions) {
     this.smooth.geometry.dispose();
     if (!positions || !positions.length) { this.smooth.visible = false; return; }

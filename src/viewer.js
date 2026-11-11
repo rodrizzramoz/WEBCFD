@@ -237,6 +237,34 @@ export class Viewer {
     return { geometries: m.geometries, textures: m.textures };
   }
 
+  // Shows the solver's cell model: skin = {positions, colors} from voxelSkin, or null to hide.
+  setPreview(skin, edges) {
+    if (!this.preview) {
+      this.preview = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0, flatShading: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
+      this.previewEdges = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0b0f16, transparent: true, opacity: 0.55 }));
+      this.scene.add(this.preview, this.previewEdges);
+    }
+    this.preview.geometry.dispose(); this.previewEdges.geometry.dispose();
+    this.preview.geometry = new THREE.BufferGeometry(); this.previewEdges.geometry = new THREE.BufferGeometry();
+    const on = !!(skin && skin.positions.length);
+    this.preview.visible = on; this.previewEdges.visible = on && edges;
+    this.model.visible = !on;
+    if (!on) return;
+    const g = this.preview.geometry, p = skin.positions;
+    g.setAttribute("position", new THREE.BufferAttribute(p, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(skin.colors, 3));
+    g.computeVertexNormals();
+    if (edges) {
+      // each cell face is two triangles (6 vertices): corners are vertices 0, 1, 2 and 5
+      const quads = p.length / 18, e = new Float32Array(quads * 24), order = [0, 1, 1, 2, 2, 5, 5, 0];
+      for (let q = 0; q < quads; q++) for (let k = 0; k < 8; k++) {
+        const src = 18 * q + 3 * order[k], dst = 24 * q + 3 * k;
+        e[dst] = p[src]; e[dst + 1] = p[src + 1]; e[dst + 2] = p[src + 2];
+      }
+      this.previewEdges.geometry.setAttribute("position", new THREE.BufferAttribute(e, 3));
+    }
+  }
+
   screenshot() {
     this.renderer.render(this.scene, this.camera);
     return this.canvas.toDataURL("image/png");
