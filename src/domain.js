@@ -333,7 +333,7 @@ function buildPorts(grid, tris, opt, box, isOpen) {
     const o = matchPort(p, openings);
     if (!o) throw new Error("A port on the " + FACE_NAMES[p.face] + " face no longer matches any opening. Press Find openings again.");
     if (ports.some((q) => q.opening === o)) continue;
-    ports.push({ type: p.type, speed: p.type === "feed" ? p.speed : 0, face: o.face, opening: o });
+    ports.push({ type: p.type, speed: p.type === "feed" ? p.speed : 0, flow: p.flow, face: o.face, opening: o });
   }
   if (ports.length > 8) throw new Error("At most 8 ports are supported. Set some openings back to Wall.");
   if (!ports.some((p) => p.type === "feed" && p.speed > 0)) throw new Error("Set at least one opening to Air fed in, with a speed above zero.");
@@ -363,7 +363,7 @@ function buildPorts(grid, tris, opt, box, isOpen) {
     const nbr = [];
     for (const c of p.opening.cells) if (reached[c + p.step]) { flags[c] = (p.type === "feed" ? INLET : OUTLET) | (p.face << 3) | (id << 6); nbr.push(c + p.step); }
     if (!nbr.length) throw new Error("The opening on the " + FACE_NAMES[p.face] + " face is blocked right behind the face at this grid detail. Raise the grid detail.");
-    return { type: p.type, speed: p.speed, face: p.face, normal: NORMALS[p.face], nbr: Uint32Array.from(nbr), area: nbr.length * dx * dx, centre: p.opening.centre };
+    return { type: p.type, speed: p.speed, flow: p.flow, face: p.face, normal: NORMALS[p.face], nbr: Uint32Array.from(nbr), area: nbr.length * dx * dx, centre: p.opening.centre };
   });
   const feeds = grid.ports.filter((p) => p.type === "feed");
   const fastest = feeds.reduce((a, b) => (b.speed > a.speed ? b : a));

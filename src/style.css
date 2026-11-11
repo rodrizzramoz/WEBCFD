@@ -126,3 +126,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, canvas:focus-vi
 .porttable th { color: var(--muted); font-weight: 500; }
 
 input[type="text"] { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; width: 100%; min-width: 0; }
+
+.conds .row2 label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; min-width: 0; }
+.conds .row2 { grid-template-columns: 1fr 1fr; align-items: end; }
+.conds .row2.one { grid-template-columns: 1fr; }
+.conds .pair { display: grid; grid-template-columns: 1fr 62px; gap: 4px; }

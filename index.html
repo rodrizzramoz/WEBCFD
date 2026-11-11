@@ -107,9 +107,18 @@
           <div id="portsBox" hidden>
             <button type="button" class="btn" id="findPorts">Find openings</button>
             <ul class="conds" id="portList"></ul>
+            <div class="field">
+              <label for="flowUnit">Show air flow in</label>
+              <select id="flowUnit">
+                <option value="m3h" selected>m3/h (cubic metres per hour)</option>
+                <option value="ls">L/s (litres per second)</option>
+                <option value="lmin">L/min (litres per minute)</option>
+                <option value="cfm">cfm (cubic feet per minute)</option>
+              </select>
+            </div>
             <label class="check" for="showRim"><input type="checkbox" id="showRim"> Show openings at the edge of the box</label>
             <p class="small" id="rimNote"></p>
-            <p class="small">Each opening where the flow space meets the outside of the part is listed. Set the one fed with compressed air to "Air fed in" with its speed, and the mouth and exit to "Open to atmosphere". The air drawn in through the open ones is the result. Hover a row to see it in the 3D view.</p>
+            <p class="small">Each opening where the flow space meets the outside of the part is listed. Set the one fed with compressed air to "Air fed in", by supply pressure in bar or psi (with the nozzle area) or by speed, and the mouth and exit to "Open to atmosphere". The air drawn in through the open ones is the result. Hover a row to see it in the 3D view.</p>
           </div>
           <div class="two" id="simplePorts">
             <div class="field">

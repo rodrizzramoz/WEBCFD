@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { readModel, toGeometry, isCad, FORMATS_TEXT } from "./io.js";
 import { voxelSkin } from "./fea/mesh.js";
 import { buildCase } from "./openfoam.js";
+import { nozzle, FLOW_UNITS, BAR, PSI } from "./airjet.js";
 import { runnerStatus, solveWithOpenFoam, describe } from "./foamrun.js";
 import { zipSync, strToU8 } from "three/addons/libs/fflate.module.js";
 import { Viewer } from "./viewer.js";
@@ -24,7 +25,7 @@ const MAX_SPEED = 1000; // m/s, far beyond where treating the fluid as incompres
 const state = {
   name: "ahmed", demo: "ahmed", unit: 0.001, mode: "external", fluid: "air", rho: 1.204, mu: 1.825e-5,
   speed: 40, res: 128, domainScale: 1, inletFace: 0, outletFace: 1, stlIsFluid: false,
-  sliceAxis: 1, slicePos: 0.5, field: "speed", walls: "exact", yaw: 0, portMode: "simple", ports: [],
+  sliceAxis: 1, slicePos: 0.5, field: "speed", walls: "exact", yaw: 0, portMode: "simple", ports: [], flowUnit: "m3h",
 };
 let source = null;            // geometry as loaded, in file units
 const rot = new THREE.Matrix4();
@@ -58,6 +59,9 @@ function fmt(v, digits = 3) {
   return String(Number(v.toPrecision(digits)));
 }
 function fmtBig(v) { return !isFinite(v) ? "-" : v >= 1e9 ? fmt(v) : v >= 1e6 ? (v / 1e6).toFixed(2) + " M" : v >= 1e3 ? (v / 1e3).toFixed(1) + " k" : String(Math.round(v)); }
+// Volume flow in the chosen unit, from m3/s.
+function fmtFlow(q) { const u = FLOW_UNITS[state.flowUnit] || FLOW_UNITS.m3h; return fmt(q * u.k) + " " + u.label; }
+
 function press(container, attr, value) {
   for (const b of container.querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.getAttribute(attr) === String(value)));
 }
@@ -397,11 +401,24 @@ function renderPorts() {
     const p = portFor(o), role = p ? p.type : "wall";
     if (o.rim && !p && !showRim) return "";
     const size = o.area >= 1e-4 ? fmt(o.area * 1e4) + " cm2" : fmt(o.area * 1e6) + " mm2";
-    const flow = p && p.type === "feed" ? ", " + fmt(p.speed * o.area * 60000) + " L/min" : "";
-    return '<li data-i="' + i + '"' + (i === hotPort ? ' class="hot"' : "") + '><span class="dot ' + role + '"></span><span>' + FACE_NAMES[o.face] + " face, " + size + (o.rim ? " (reaches the edge)" : "") + flow + "</span>" +
-      '<span class="row2"><select data-role="' + i + '" aria-label="Role of this opening">' +
-      ["wall:Wall (blocked)", "open:Open to atmosphere", "feed:Air fed in"].map((r) => { const [v, t] = r.split(":"); return '<option value="' + v + '"' + (v === role ? " selected" : "") + ">" + t + "</option>"; }).join("") +
-      '</select><input type="number" data-speed="' + i + '" min="0.001" step="any" value="' + (p && p.type === "feed" ? p.speed : 20) + '" aria-label="Speed in m/s"' + (role === "feed" ? "" : " hidden") + "></span></li>";
+    const opts = (list, cur) => list.map((r) => { const [v, t] = r.split(":"); return '<option value="' + v + '"' + (v === cur ? " selected" : "") + ">" + t + "</option>"; }).join("");
+    let feed = "";
+    if (role === "feed") {
+      const byP = p.spec === "pressure";
+      feed = '<span class="row2"><label>Set by<select data-spec="' + i + '">' + opts(["speed:Speed", "pressure:Supply pressure"], byP ? "pressure" : "speed") + "</select></label>" +
+        (byP
+          ? '<label>Pressure (gauge)<span class="pair"><input type="number" data-pressure="' + i + '" min="0.001" step="any" value="' + fmt(p.pressure / (p.punit === "psi" ? PSI : BAR), 4) + '"><select data-punit="' + i + '">' + opts(["bar:bar", "psi:psi"], p.punit || "bar") + "</select></span></label></span>" +
+            '<span class="row2 one"><label>Nozzle area, mm2 (the smallest gap the air squeezes through)<input type="number" data-nozzle="' + i + '" min="0.001" step="any" value="' + fmt(p.nozzleArea * 1e6, 4) + '"></label></span>'
+          : '<label>Speed, m/s<input type="number" data-speed="' + i + '" min="0.001" step="any" value="' + p.speed + '"></label></span>');
+      let note;
+      if (byP) {
+        const n = nozzle(p.pressure, p.nozzleArea);
+        note = "Uses " + fmtFlow(n.freeAir) + " of free air, thrust " + fmt(n.thrust) + " N, jet " + fmt(n.jetSpeed) + " m/s" + (n.choked ? " after leaving the nozzle at the speed of sound" : "") + ". Simulated as an equal-thrust jet.";
+      } else note = "That is " + fmtFlow(p.speed * o.area) + " through this opening.";
+      feed += '<span class="row2 one small">' + note + "</span>";
+    }
+    return '<li data-i="' + i + '"' + (i === hotPort ? ' class="hot"' : "") + '><span class="dot ' + role + '"></span><span>' + FACE_NAMES[o.face] + " face, " + size + (o.rim ? " (reaches the edge)" : "") + "</span>" +
+      '<span class="row2 one"><select data-role="' + i + '" aria-label="Role of this opening">' + opts(["wall:Wall (blocked)", "open:Open to atmosphere", "feed:Air fed in"], role) + "</select></span>" + feed + "</li>";
   }).join("");
   drawPortMarks();
 }
@@ -411,10 +428,23 @@ function drawPortMarks() {
   viewer.setPortMarks(openings.map((o, i) => { const p = portFor(o); return { face: o.face, cells: o.cells, color: ROLE_COLOR[p ? p.type : "wall"], hot: i === hotPort }; }), openBox);
 }
 
-function setPortRole(i, role, speed) {
+// Sets or changes one opening's role. change: fields to merge into a fed port.
+function setPortRole(i, role, change) {
   const o = openings[i], old = portFor(o);
   state.ports = state.ports.filter((p) => p !== old);
-  if (role !== "wall") state.ports.push({ face: o.face, point: Array.from(o.point), type: role, speed: role === "feed" ? Math.max(0.001, speed || 20) : 0 });
+  if (role !== "wall") {
+    const base = { spec: "speed", speed: 20, pressure: 2 * BAR, punit: "bar", nozzleArea: o.area, ...(old && old.type === "feed" ? old : {}) };
+    const p = { ...base, ...(change || {}), face: o.face, point: Array.from(o.point), type: role };
+    if (role === "feed") {
+      if (p.spec === "pressure") {
+        // equal-thrust incompressible jet through the nozzle, expressed as a speed over this opening
+        const n = nozzle(p.pressure, p.nozzleArea);
+        p.speed = n.equivalentSpeed * p.nozzleArea / o.area;
+        p.flow = n.freeAir;
+      } else { p.speed = Math.max(0.001, p.speed || 20); delete p.flow; }
+    } else p.speed = 0;
+    state.ports.push(p);
+  }
   renderPorts(); invalidate();
 }
 
@@ -435,9 +465,9 @@ function renderPortTable(show) {
   }
   box.hidden = !(show && lastPorts && prepared);
   if (box.hidden) return;
-  box.innerHTML = '<table class="porttable"><tr><th>Opening</th><th>Role</th><th>Flow, L/min</th><th>Mean speed, m/s</th><th>Pressure, Pa</th></tr>' +
+  box.innerHTML = '<table class="porttable"><tr><th>Opening</th><th>Role</th><th>Flow, " + FLOW_UNITS[state.flowUnit].label + "</th><th>Mean speed, m/s</th><th>Pressure, Pa</th></tr>' +
     lastPorts.map((r) => "<tr><td>" + FACE_NAMES[r.port.face] + " face, " + fmt(r.port.area * 1e4) + " cm2</td><td>" + (r.port.type === "feed" ? "Air fed in" : r.q >= 0 ? "Open, drawing in" : "Open, blowing out") +
-      "</td><td>" + fmt(Math.abs(r.q) * 60000) + "</td><td>" + fmt(Math.abs(r.q) / r.port.area) + "</td><td>" + fmt(r.p) + "</td></tr>").join("") + "</table>";
+      "</td><td>" + fmt(Math.abs(r.q) * FLOW_UNITS[state.flowUnit].k) + "</td><td>" + fmt(Math.abs(r.q) / r.port.area) + "</td><td>" + fmt(r.p) + "</td></tr>").join("") + "</table>";
 }
 
 // ---------- Run loop ----------
@@ -516,10 +546,12 @@ function ingest(data) {
     let fed = 0, drawn = 0, out = 0;
     pm.forEach((m, i) => {
       const q = m.q * toQ;
-      if (grid.ports[i].type === "feed") fed += q; else if (q > 0) drawn += q; else out -= q;
+      // a port set by supply pressure reports its true air use, not the equal-thrust stand-in
+      if (grid.ports[i].type === "feed") fed += grid.ports[i].flow || q; else if (q > 0) drawn += q; else out -= q;
     });
     lastPorts = pm.map((m, i) => ({ q: m.q * toQ, p: m.p * lat.pres, port: grid.ports[i] }));
-    row = { t, fed, drawn, out, ratio: fed > 0 ? drawn / fed : 0, balance: fed + drawn > 0 ? out / (fed + drawn) : 0, peak: st.vmax * lat.vel };
+    const simIn = pm.reduce((a, m, i) => a + (grid.ports[i].type === "feed" || m.q > 0 ? m.q * toQ : 0), 0);
+    row = { t, fed, drawn, out, ratio: fed > 0 ? drawn / fed : 0, balance: simIn > 0 ? out / simIn : 0, peak: st.vmax * lat.vel };
   } else {
     const im = internalMetrics(grid, data.macro);
     const toQ = lat.vel * grid.dx * grid.dx;
@@ -682,11 +714,11 @@ function renderTiles() {
   const v = (key, unit) => (s ? fmt(s[key]) + (unit ? " " + unit : "") : "-");
   const re = lat && prepared ? fmtBig(lat.reynolds) : "-";
   const portRun = !ext && state.portMode === "ports";
-  const lpm = (key) => (s && key in s ? fmt(s[key] * 60000) + " L/min" : "-");
+  const lpm = (key) => (s && key in s ? fmtFlow(s[key]) : "-");
   const tiles = portRun ? [
     ["a", "Air drawn in", lpm("drawn"), "pulled in through the open ports"],
     ["b", "Amplification", s && "ratio" in s ? fmt(s.ratio) + " x" : "-", "air drawn in per unit of air fed"],
-    ["", "Air fed in", lpm("fed"), "through the fed ports"],
+    ["", "Air fed in", lpm("fed"), "free air used by the fed ports"],
     ["", "Air out", lpm("out"), "leaving through the open ports"],
     ["", "Peak speed", v("peak", "m/s"), "fastest point in the flow"],
     ["", "Mass balance", s && "balance" in s ? fmt(100 * s.balance) + " %" : "-", "air out against air in"],
@@ -699,7 +731,7 @@ function renderTiles() {
     ["", "Reynolds number", re, "based on model length"],
   ] : [
     ["a", "Pressure loss", v("loss", "Pa"), s ? "total pressure; static drop is " + fmt(s.dp) + " Pa" : "total pressure, inlet to outlet"],
-    ["b", "Flow rate", s ? fmt(s.q * 60000) + " L/min" : "-", "leaving through the outlet"],
+    ["b", "Flow rate", s ? fmtFlow(s.q) : "-", "leaving through the outlet"],
     ["", "Mean inlet speed", s && grid && prepared ? fmt(s.qin / grid.inletArea) + " m/s" : "-", "target " + fmt(state.speed) + " m/s"],
     ["", "Peak speed", v("peak", "m/s"), "fastest point in the flow"],
     ["", "Mass balance", s ? fmt(100 * s.balance) + " %" : "-", "mass out against mass in"],
@@ -776,6 +808,7 @@ function syncInputs(keepGhost) {
   }
   $("domainScale").value = String(state.domainScale);
   $("walls").value = state.walls;
+  $("flowUnit").value = state.flowUnit;
   $("inletFace").value = String(state.inletFace);
   $("outletFace").value = String(state.outletFace);
   $("stlKind").value = state.stlIsFluid ? "fluid" : "solid";
@@ -851,12 +884,15 @@ function cleanSetup(s) {
   oneOf("domainScale", optionValues("domainScale"));
   oneOf("walls", ["exact", "cubes"]);
   oneOf("portMode", ["simple", "ports"]);
+  oneOf("flowUnit", Object.keys(FLOW_UNITS));
   if ("ports" in s) {
     if (!Array.isArray(s.ports) || s.ports.length > 8) bad("ports");
     out.ports = s.ports.map((p) => {
       const ok = p && [0, 1, 2, 3, 4, 5].includes(p.face) && ["feed", "open"].includes(p.type) && Array.isArray(p.point) && p.point.length === 3 && p.point.every((v) => typeof v === "number" && isFinite(v)) && typeof p.speed === "number" && p.speed >= 0 && p.speed <= 1000;
       if (!ok) bad("ports");
-      return { face: p.face, type: p.type, point: p.point.slice(), speed: p.speed };
+      const q = { face: p.face, type: p.type, point: p.point.slice(), speed: p.speed };
+      if (p.spec === "pressure" && p.pressure > 0 && p.pressure <= 5e6 && p.nozzleArea > 0 && p.nozzleArea < 1) Object.assign(q, { spec: "pressure", pressure: p.pressure, punit: p.punit === "psi" ? "psi" : "bar", nozzleArea: p.nozzleArea, flow: nozzle(p.pressure, p.nozzleArea).freeAir });
+      return q;
     });
   }
   oneOf("inletFace", [0, 1, 2, 3, 4, 5]); oneOf("outletFace", [0, 1, 2, 3, 4, 5]);
@@ -945,10 +981,16 @@ function wire() {
   });
   $("findPorts").addEventListener("click", findOpenings);
   $("showRim").addEventListener("change", renderPorts);
+  $("flowUnit").addEventListener("change", (e) => { state.flowUnit = e.target.value; renderPorts(); renderTiles(); });
   $("portList").addEventListener("change", (e) => {
     const t = e.target;
-    if (t.dataset.role !== undefined) setPortRole(+t.dataset.role, t.value, 20);
-    else if (t.dataset.speed !== undefined) setPortRole(+t.dataset.speed, "feed", +t.value);
+    const d = t.dataset, num = Math.max(0.001, +t.value || 0.001);
+    if (d.role !== undefined) setPortRole(+d.role, t.value);
+    else if (d.speed !== undefined) setPortRole(+d.speed, "feed", { speed: num });
+    else if (d.spec !== undefined) setPortRole(+d.spec, "feed", { spec: t.value });
+    else if (d.nozzle !== undefined) setPortRole(+d.nozzle, "feed", { nozzleArea: num * 1e-6 });
+    else if (d.punit !== undefined) { const p = portFor(openings[+d.punit]); setPortRole(+d.punit, "feed", { punit: t.value, pressure: p.pressure / (p.punit === "psi" ? PSI : BAR) * (t.value === "psi" ? PSI : BAR) }); }
+    else if (d.pressure !== undefined) { const p = portFor(openings[+d.pressure]); setPortRole(+d.pressure, "feed", { pressure: num * (p.punit === "psi" ? PSI : BAR) }); }
   });
   $("portList").addEventListener("pointerover", (e) => {
     const li = e.target.closest("li"); const i = li ? +li.dataset.i : -1;
