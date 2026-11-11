@@ -52,6 +52,16 @@ function pipe() {
   return new THREE.CylinderGeometry(10, 10, 100, 64).rotateZ(-Math.PI / 2).translate(50, 0, 0);
 }
 
+function jetPump() {
+  // Air mover: a 30 mm bore tube with a small 6 mm nozzle tube on its axis.
+  // Compressed air fed through the nozzle drags surrounding air in through the ring around it.
+  const tube = (rIn, rOut, x0, x1) => {
+    const pts = [[rIn, x0], [rIn, x1], [rOut, x1], [rOut, x0], [rIn, x0]].map(([r, y]) => new THREE.Vector2(r, y));
+    return new THREE.LatheGeometry(pts, 64).rotateZ(-Math.PI / 2).toNonIndexed();
+  };
+  return mergeGeometries([tube(15, 20, 0, 140), tube(3, 5.5, 0, 35)]);
+}
+
 export const DEMOS = {
   ahmed: {
     label: "Ahmed car body (external)", build: ahmedBody,
@@ -72,6 +82,17 @@ export const DEMOS = {
   pipe: {
     label: "Straight pipe, oil, laminar check (internal)", build: pipe,
     setup: { mode: "internal", fluid: "oil", speed: 0.5, inletFace: 0, outletFace: 1, stlIsFluid: true },
+  },
+  jetpump: {
+    label: "Air mover with a compressed-air nozzle (custom ports)", build: jetPump,
+    setup: {
+      mode: "internal", fluid: "air", speed: 30, inletFace: 0, outletFace: 1, stlIsFluid: false, portMode: "ports",
+      ports: [
+        { face: 0, point: [0, 0, 0], type: "feed", speed: 30 },
+        { face: 0, point: [0, 0.0105, 0], type: "open", speed: 0 },
+        { face: 1, point: [0.14, 0, 0], type: "open", speed: 0 },
+      ],
+    },
   },
   elbow: {
     label: "Pipe elbow, fluid volume (internal)", build: elbow,

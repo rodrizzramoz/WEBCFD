@@ -4,13 +4,14 @@
 const FORCE_SCALE = 131072; // fixed-point scale for the on-GPU force sum
 
 const WGSL = /* wgsl */ `
-struct Params { dims: vec4u, uin: vec4f, misc: vec4f };
+struct Params { dims: vec4u, uin: vec4f, misc: vec4f, ports: array<vec4f, 8> };
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> src: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(3) var<storage, read> flags: array<u32>;
 @group(0) @binding(4) var<storage, read_write> fields: array<vec4f>;
 @group(0) @binding(5) var<storage, read_write> forceAcc: array<atomic<i32>, 4>;
+@group(0) @binding(6) var<storage, read> wallQ: array<u32>;
 
 const C = array<vec3i, 19>(
   vec3i(0, 0, 0),
@@ -61,6 +62,8 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
     // values and whatever is extrapolated from the cell just inside.
     var rho = 1.0;
     var u = P.uin.xyz;
+    // Inlet cells carry a port number in bits 6 to 8; each port has its own speed along its face normal.
+    if (t == 3u) { u = vec3f(NRM[(flag >> 3u) & 7u]) * P.ports[(flag >> 6u) & 7u].x; }
     if (t != 2u) {
       let j = cellIndex(pos + NRM[(flag >> 3u) & 7u]);
       var rn = 1.0;
@@ -87,15 +90,33 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
   var f: array<f32, 19>;
   f[0] = src[i];
   var force = vec3f(0.0);
+  // Bits 6 and up of the flag point at this cell's wall table entry (0 = none):
+  // one byte per link giving how far along the link the true surface lies.
+  let wi = flag >> 6u;
   for (var q = 1u; q < 19u; q++) {
     let j = cellIndex(pos - C[q]);
     if ((flags[j] & 7u) == 1u) {
       let o = q + 1u - 2u * ((q + 1u) % 2u);
-      let v = src[o * n + i];
-      f[q] = v;
-      // The rest-state part (weight only) cancels over a closed surface, so leave it
-      // out to keep precision for the small net force.
-      force += 2.0 * (v - wq(o)) * vec3f(C[o]);
+      let vo = src[o * n + i];
+      var back = vo; // half-way bounce-back: the wall sits midway between the two cell centres
+      if (wi > 0u) {
+        let k = q - 1u;
+        let b = (wallQ[(wi - 1u) * 5u + (k >> 2u)] >> (8u * (k & 3u))) & 255u;
+        if (b > 0u) {
+          // interpolated bounce-back at the true wall position d (fraction of the link)
+          let d = f32(b) / 255.0;
+          if (d < 0.5) {
+            let j2 = cellIndex(pos + C[q]);
+            if ((flags[j2] & 7u) != 1u) { back = 2.0 * d * vo + (1.0 - 2.0 * d) * src[o * n + j2]; }
+          } else {
+            back = (vo + (2.0 * d - 1.0) * src[q * n + i]) / (2.0 * d);
+          }
+        }
+      }
+      f[q] = back;
+      // Momentum handed to the wall: what left plus what came back. The rest-state
+      // part (weight only) cancels over a closed surface, so leave it out for precision.
+      force += ((vo - wq(o)) + (back - wq(o))) * vec3f(C[o]);
     } else {
       f[q] = src[q * n + j];
     }
@@ -164,6 +185,7 @@ export class Solver {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, ...st("read-only-storage") },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, ...st("storage") },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, ...st("storage") },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, ...st("read-only-storage") },
       ],
     });
     const pl = device.createPipelineLayout({ bindGroupLayouts: [s.layout] });
@@ -197,10 +219,13 @@ export class Solver {
     this.flagBuf = mk(n * 4, S | CD);
     this.macroBuf = mk(n * 16, S | CS);
     this.forceBuf = mk(16, S | CS | CD);
-    this.paramBuf = mk(48, GPUBufferUsage.UNIFORM | CD);
+    this.paramBuf = mk(176, GPUBufferUsage.UNIFORM | CD);
     this.macroStage = mk(n * 16, GPUBufferUsage.MAP_READ | CD);
     this.forceStage = mk(16, GPUBufferUsage.MAP_READ | CD);
     d.queue.writeBuffer(this.flagBuf, 0, grid.flags);
+    const wallQ = grid.wallQ && grid.wallQ.length ? grid.wallQ : new Uint32Array(5);
+    this.wallBuf = mk(wallQ.byteLength, S | CD);
+    d.queue.writeBuffer(this.wallBuf, 0, wallQ);
     const group = (a, b) => d.createBindGroup({
       layout: this.layout,
       entries: [
@@ -210,6 +235,7 @@ export class Solver {
         { binding: 3, resource: { buffer: this.flagBuf } },
         { binding: 4, resource: { buffer: this.macroBuf } },
         { binding: 5, resource: { buffer: this.forceBuf } },
+        { binding: 6, resource: { buffer: this.wallBuf } },
       ],
     });
     this.groups = [group(this.fA, this.fB), group(this.fB, this.fA)];
@@ -231,12 +257,15 @@ export class Solver {
 
   writeParams(ramp) {
     const g = this.grid, l = this.lat;
-    const buf = new ArrayBuffer(48);
+    const buf = new ArrayBuffer(176);
     new Uint32Array(buf, 0, 4).set([g.nx, g.ny, g.nz, 0]);
     new Float32Array(buf, 16, 8).set([
       l.uin[0] * ramp, l.uin[1] * ramp, l.uin[2] * ramp, l.tau,
       l.smag, FORCE_SCALE, l.initWithFlow ? 1 : 0, 0,
     ]);
+    // lattice speed of each inlet port (up to 8), one vec4 each
+    const ports = new Float32Array(buf, 48, 32);
+    (l.portU || []).slice(0, 8).forEach((u, i) => { ports[4 * i] = u * ramp; });
     this.device.queue.writeBuffer(this.paramBuf, 0, buf);
   }
 

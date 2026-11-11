@@ -237,6 +237,30 @@ export class Viewer {
     return { geometries: m.geometries, textures: m.textures };
   }
 
+  // Coloured patches for the openings in custom port mode.
+  // marks: [{face, cells, color}], box: {dims, dx, origin}
+  setPortMarks(marks, box) {
+    if (!this.portMarks) { this.portMarks = new THREE.Group(); this.scene.add(this.portMarks); }
+    for (const o of [...this.portMarks.children]) { o.geometry.dispose(); o.material.dispose(); this.portMarks.remove(o); }
+    if (!marks) return;
+    const [nx, ny] = box.dims, h = box.dx;
+    for (const m of marks) {
+      const a = m.face >> 1, b = (a + 1) % 3, c = (a + 2) % 3, pos = new Float32Array(m.cells.length * 18);
+      const plane = box.origin[a] + (m.face & 1 ? box.dims[a] * h : 0);
+      m.cells.forEach((cell, n) => {
+        const ijk = [cell % nx, ((cell / nx) | 0) % ny, (cell / (nx * ny)) | 0];
+        const u0 = box.origin[b] + ijk[b] * h, v0 = box.origin[c] + ijk[c] * h;
+        const quad = [[u0, v0], [u0 + h, v0], [u0 + h, v0 + h], [u0, v0], [u0 + h, v0 + h], [u0, v0 + h]];
+        quad.forEach((q, k) => { const o = 18 * n + 3 * k; pos[o + a] = plane; pos[o + b] = q[0]; pos[o + c] = q[1]; });
+      });
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: m.color, transparent: true, opacity: m.hot ? 0.85 : 0.45, side: THREE.DoubleSide, depthWrite: false }));
+      mesh.renderOrder = 4;
+      this.portMarks.add(mesh);
+    }
+  }
+
   // Shows the solver's cell model: skin = {positions, colors} from voxelSkin, or null to hide.
   setPreview(skin, edges) {
     if (!this.preview) {

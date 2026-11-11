@@ -2,11 +2,14 @@ import "./style.css";
 import * as THREE from "three";
 import { readModel, toGeometry, isCad, FORMATS_TEXT } from "./io.js";
 import { voxelSkin } from "./fea/mesh.js";
+import { buildCase } from "./openfoam.js";
+import { runnerStatus, solveWithOpenFoam, describe } from "./foamrun.js";
+import { zipSync, strToU8 } from "three/addons/libs/fflate.module.js";
 import { Viewer } from "./viewer.js";
 import { Solver } from "./solver.js";
 import { DEMOS } from "./demos.js";
-import { buildDomain, domainBox, FACE_NAMES, NORMALS } from "./domain.js";
-import { fieldStats, sliceImage, streamlines, makeSeeds, surfaceColors, internalMetrics, probe, seedCluster, LUT_CSS } from "./results.js";
+import { buildDomain, domainBox, FACE_NAMES, NORMALS, scanOpenings, matchPort } from "./domain.js";
+import { portMetrics, fieldStats, sliceImage, streamlines, makeSeeds, surfaceColors, internalMetrics, probe, seedCluster, LUT_CSS } from "./results.js";
 
 const $ = (id) => document.getElementById(id);
 const FLUIDS = {
@@ -21,7 +24,7 @@ const MAX_SPEED = 1000; // m/s, far beyond where treating the fluid as incompres
 const state = {
   name: "ahmed", demo: "ahmed", unit: 0.001, mode: "external", fluid: "air", rho: 1.204, mu: 1.825e-5,
   speed: 40, res: 128, domainScale: 1, inletFace: 0, outletFace: 1, stlIsFluid: false,
-  sliceAxis: 1, slicePos: 0.5, field: "speed", yaw: 0,
+  sliceAxis: 1, slicePos: 0.5, field: "speed", walls: "exact", yaw: 0, portMode: "simple", ports: [],
 };
 let source = null;            // geometry as loaded, in file units
 const rot = new THREE.Matrix4();
@@ -85,6 +88,8 @@ function setSource(geometry, name) {
   rot.identity();
   state.name = name;
   state.yaw = 0;
+  state.ports = []; openings = []; lastPorts = null;
+  if (document.getElementById("portList")) renderPorts();
   $("yaw").value = "0"; $("yawOut").textContent = "0";
   bake(true);
 }
@@ -109,13 +114,15 @@ function bake(refit) {
 
 function loadDemo(key) {
   const d = DEMOS[key];
-  Object.assign(state, d.setup, { demo: key });
+  Object.assign(state, { portMode: "simple" }, d.setup, { demo: key });
+  const demoPorts = (d.setup.ports || []).map((p) => ({ ...p }));
   lastFile = null; $("cadField").hidden = true;
   state.unit = 0.001;
   const f = FLUIDS[state.fluid];
   state.rho = f.rho; state.mu = f.mu;
   syncInputs();
   setSource(d.build(), d.label);
+  if (demoPorts.length) { state.ports = demoPorts; findOpenings(); invalidate(); }
 }
 
 // Counts triangle edges that are not shared by exactly two triangles. A closed
@@ -209,11 +216,14 @@ function options() {
   return {
     mode: state.mode, res: state.res, domainScale: state.domainScale,
     inletFace: state.inletFace, outletFace: state.outletFace, stlIsFluid: state.stlIsFluid,
+    walls: state.walls,
+    portMode: state.mode === "internal" ? state.portMode : "simple", ports: state.ports,
   };
 }
 
 function latticeFor(g) {
-  const nu = state.mu / state.rho, U = state.speed, dx = g.dx;
+  // In custom port mode the fastest fed port sets the scale; every other port is a fraction of it.
+  const nu = state.mu / state.rho, U = g.portMode ? g.refSpeed : state.speed, dx = g.dx;
   let uLat = Math.min(0.07, 0.11 / g.speedUp) * speedLimit;
   let nuLat = nu * uLat / (U * dx);
   if (nuLat > 0.3) { uLat *= 0.3 / nuLat; nuLat = 0.3; } // very viscous flow: shorten the time step instead
@@ -222,6 +232,7 @@ function latticeFor(g) {
   return {
     uLat, dt, nuLat, tau: 3 * nuLat + 0.5, smag: 18 * Math.SQRT2 * 0.12 * 0.12,
     uin: g.inVec.map((c) => c * uLat),
+    portU: g.portMode ? g.ports.map((p) => uLat * p.speed / U) : [uLat],
     initWithFlow: g.mode === "external",
     rampSteps: g.mode === "external" ? 0 : 20 * longest,
     vel: U / uLat,                          // lattice speed to m/s
@@ -357,6 +368,78 @@ function flowChanged(dragging) {
   if (!running) $("status").textContent = "Flow settings changed. Press Run to carry on from the current flow with the new values.";
 }
 
+// ---------- Custom ports ----------
+let openings = [], openBox = null, lastPorts = null, hotPort = -1;
+const ROLE_COLOR = { wall: 0x8a96a3, open: 0x4fb0f0, feed: 0x35c26b };
+
+function portFor(o) { return state.ports.find((p) => p.face === o.face && matchPort(p, openings) === o); }
+
+function findOpenings() {
+  if (!tris) return;
+  try {
+    const r = scanOpenings(tris, options());
+    // real ports first; openings that reach the edge of a face are usually just the space around the part
+    openings = r.openings.sort((a, b) => (a.rim - b.rim) || (b.area - a.area)).slice(0, 40);
+    openBox = r.box;
+    // drop saved ports that no longer match anything
+    state.ports = state.ports.filter((p) => matchPort(p, openings));
+  } catch (e) { notify(e.message, true); openings = []; }
+  renderPorts();
+  if (!openings.length) notify("No openings were found. If the walls are thin, raise the grid detail so they do not vanish, or check what the model represents (solid part or fluid volume).", true);
+}
+
+function renderPorts() {
+  const list = $("portList");
+  const showRim = $("showRim").checked || !openings.some((o) => !o.rim);
+  const hidden = openings.filter((o) => o.rim && !portFor(o)).length;
+  $("rimNote").textContent = hidden && !showRim ? hidden + " more reach the edge of the box and are hidden. They are usually the space around the part." : "";
+  list.innerHTML = openings.map((o, i) => {
+    const p = portFor(o), role = p ? p.type : "wall";
+    if (o.rim && !p && !showRim) return "";
+    const size = o.area >= 1e-4 ? fmt(o.area * 1e4) + " cm2" : fmt(o.area * 1e6) + " mm2";
+    const flow = p && p.type === "feed" ? ", " + fmt(p.speed * o.area * 60000) + " L/min" : "";
+    return '<li data-i="' + i + '"' + (i === hotPort ? ' class="hot"' : "") + '><span class="dot ' + role + '"></span><span>' + FACE_NAMES[o.face] + " face, " + size + (o.rim ? " (reaches the edge)" : "") + flow + "</span>" +
+      '<span class="row2"><select data-role="' + i + '" aria-label="Role of this opening">' +
+      ["wall:Wall (blocked)", "open:Open to atmosphere", "feed:Air fed in"].map((r) => { const [v, t] = r.split(":"); return '<option value="' + v + '"' + (v === role ? " selected" : "") + ">" + t + "</option>"; }).join("") +
+      '</select><input type="number" data-speed="' + i + '" min="0.001" step="any" value="' + (p && p.type === "feed" ? p.speed : 20) + '" aria-label="Speed in m/s"' + (role === "feed" ? "" : " hidden") + "></span></li>";
+  }).join("");
+  drawPortMarks();
+}
+
+function drawPortMarks() {
+  if (state.mode !== "internal" || state.portMode !== "ports" || !openings.length) { viewer.setPortMarks(null); return; }
+  viewer.setPortMarks(openings.map((o, i) => { const p = portFor(o); return { face: o.face, cells: o.cells, color: ROLE_COLOR[p ? p.type : "wall"], hot: i === hotPort }; }), openBox);
+}
+
+function setPortRole(i, role, speed) {
+  const o = openings[i], old = portFor(o);
+  state.ports = state.ports.filter((p) => p !== old);
+  if (role !== "wall") state.ports.push({ face: o.face, point: Array.from(o.point), type: role, speed: role === "feed" ? Math.max(0.001, speed || 20) : 0 });
+  renderPorts(); invalidate();
+}
+
+function showFoamResult(run) {
+  let box = $("foamTable");
+  if (!box) { box = document.createElement("div"); box.id = "foamTable"; box.className = "chartbox"; $("tiles").after(box); }
+  box.innerHTML = '<div class="head"><span class="lbl">OpenFOAM result for this setup (steady, body-fitted mesh)</span></div><table class="porttable">' +
+    describe(run).map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>").join("") + "</table>";
+  box.hidden = false;
+}
+
+function renderPortTable(show) {
+  let box = $("portTable");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "portTable"; box.className = "chartbox";
+    $("tiles").after(box);
+  }
+  box.hidden = !(show && lastPorts && prepared);
+  if (box.hidden) return;
+  box.innerHTML = '<table class="porttable"><tr><th>Opening</th><th>Role</th><th>Flow, L/min</th><th>Mean speed, m/s</th><th>Pressure, Pa</th></tr>' +
+    lastPorts.map((r) => "<tr><td>" + FACE_NAMES[r.port.face] + " face, " + fmt(r.port.area * 1e4) + " cm2</td><td>" + (r.port.type === "feed" ? "Air fed in" : r.q >= 0 ? "Open, drawing in" : "Open, blowing out") +
+      "</td><td>" + fmt(Math.abs(r.q) * 60000) + "</td><td>" + fmt(Math.abs(r.q) / r.port.area) + "</td><td>" + fmt(r.p) + "</td></tr>").join("") + "</table>";
+}
+
 // ---------- Run loop ----------
 async function runLoop(token) {
   let k = 2, lastRead = performance.now() - 150;
@@ -428,6 +511,15 @@ function ingest(data) {
     const f = data.force.map((v) => v * lat.force);
     const qA = 0.5 * state.rho * state.speed ** 2 * grid.frontalArea;
     row = { t, drag: f[0], side: f[1], lift: f[2], cd: f[0] / qA, cl: f[2] / qA };
+  } else if (grid.portMode) {
+    const pm = portMetrics(grid, data.macro), toQ = lat.vel * grid.dx * grid.dx;
+    let fed = 0, drawn = 0, out = 0;
+    pm.forEach((m, i) => {
+      const q = m.q * toQ;
+      if (grid.ports[i].type === "feed") fed += q; else if (q > 0) drawn += q; else out -= q;
+    });
+    lastPorts = pm.map((m, i) => ({ q: m.q * toQ, p: m.p * lat.pres, port: grid.ports[i] }));
+    row = { t, fed, drawn, out, ratio: fed > 0 ? drawn / fed : 0, balance: fed + drawn > 0 ? out / (fed + drawn) : 0, peak: st.vmax * lat.vel };
   } else {
     const im = internalMetrics(grid, data.macro);
     const toQ = lat.vel * grid.dx * grid.dx;
@@ -524,6 +616,7 @@ function addSmoke(e) {
 }
 
 function pickPort(e) {
+  if (state.portMode === "ports") return; // custom ports are set from the list, not by clicking box faces
   const f = viewer.pickFace(e.clientX, e.clientY);
   if (f < 0) return;
   const wasIn = state.inletFace, wasOut = state.outletFace;
@@ -588,7 +681,16 @@ function renderTiles() {
   const s = smooth, ext = state.mode === "external";
   const v = (key, unit) => (s ? fmt(s[key]) + (unit ? " " + unit : "") : "-");
   const re = lat && prepared ? fmtBig(lat.reynolds) : "-";
-  const tiles = ext ? [
+  const portRun = !ext && state.portMode === "ports";
+  const lpm = (key) => (s && key in s ? fmt(s[key] * 60000) + " L/min" : "-");
+  const tiles = portRun ? [
+    ["a", "Air drawn in", lpm("drawn"), "pulled in through the open ports"],
+    ["b", "Amplification", s && "ratio" in s ? fmt(s.ratio) + " x" : "-", "air drawn in per unit of air fed"],
+    ["", "Air fed in", lpm("fed"), "through the fed ports"],
+    ["", "Air out", lpm("out"), "leaving through the open ports"],
+    ["", "Peak speed", v("peak", "m/s"), "fastest point in the flow"],
+    ["", "Mass balance", s && "balance" in s ? fmt(100 * s.balance) + " %" : "-", "air out against air in"],
+  ] : ext ? [
     ["a", "Drag coefficient", v("cd"), grid && prepared ? "Cd, on " + fmt(grid.frontalArea * 1e4) + " cm2 frontal area" : "Cd"],
     ["b", "Lift coefficient", v("cl"), "Cl, positive is up (+Z)"],
     ["", "Drag force", v("drag", "N"), "along the flow (+X)"],
@@ -605,7 +707,8 @@ function renderTiles() {
   ];
   $("tiles").innerHTML = tiles.map((t) =>
     '<div class="tile ' + t[0] + '"><div class="lbl">' + t[1] + '</div><div class="value">' + t[2] + '</div><div class="sub">' + t[3] + "</div></div>").join("");
-  $("chartKey").innerHTML = (ext ? [["a", "Drag Cd"], ["b", "Lift Cl"]] : [["a", "Total pressure loss, Pa"]])
+  renderPortTable(portRun);
+  $("chartKey").innerHTML = (ext ? [["a", "Drag Cd"], ["b", "Lift Cl"]] : portRun ? [["a", "Amplification"]] : [["a", "Total pressure loss, Pa"]])
     .map((k) => '<span class="key"><i style="background: var(--series-' + k[0] + ')"></i>' + k[1] + "</span>").join("");
 }
 
@@ -615,7 +718,7 @@ function drawChart() {
   if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   const g = c.getContext("2d"), cs = getComputedStyle(document.documentElement);
   g.clearRect(0, 0, w, h);
-  const keys = state.mode === "external" ? ["cd", "cl"] : ["loss"];
+  const keys = state.mode === "external" ? ["cd", "cl"] : state.portMode === "ports" ? ["ratio"] : ["loss"];
   const rows = history.length > 600 ? history.filter((_, i) => i % Math.ceil(history.length / 600) === 0) : history;
   let lo = 0, hi = 0;
   // ignore the start-up transient when scaling
@@ -672,6 +775,7 @@ function syncInputs(keepGhost) {
     if (!preset) $("resCustom").value = state.res;
   }
   $("domainScale").value = String(state.domainScale);
+  $("walls").value = state.walls;
   $("inletFace").value = String(state.inletFace);
   $("outletFace").value = String(state.outletFace);
   $("stlKind").value = state.stlIsFluid ? "fluid" : "solid";
@@ -680,11 +784,18 @@ function syncInputs(keepGhost) {
   press($("field"), "data-field", state.field);
   const internal = state.mode === "internal";
   $("internalOpts").hidden = !internal;
+  const custom = internal && state.portMode === "ports";
+  $("portMode").value = state.portMode;
+  $("portsBox").hidden = !custom; $("simplePorts").hidden = custom;
+  for (const id of ["speed", "speedSlider"]) $(id).disabled = custom;
+  drawPortMarks();
   $("domainField").hidden = internal;
   $("yawField").hidden = internal;
   $("customFluid").hidden = state.fluid !== "custom";
   $("speedLabel").textContent = internal ? "Inlet speed, m/s" : "Wind speed, m/s";
-  $("flowHint").textContent = internal
+  $("flowHint").textContent = internal && state.portMode === "ports"
+    ? "Green patches are fed with air, blue patches are open to the surrounding air, grey ones are blocked. Speeds much above 100 m/s are compressible in reality; this solver treats air as incompressible, so a real compressed-air jet is only approximated. Use the OpenFOAM case export for a second opinion."
+    : internal
     ? "Flow enters through the openings on the green face and leaves through the orange face. Every other surface is a wall. Click a face of the box in the 3D view to make it the inlet, or Alt + click to make it the outlet."
     : "Flow runs along +X, from the green face to the orange face. Rotate the model to point it into the wind, or use the yaw angle for a crosswind. Z is up.";
   if (!keepGhost) {
@@ -738,6 +849,16 @@ function cleanSetup(s) {
   oneOf("fluid", ["air", "water", "oil", "custom"]);
   number("res", 32, 1024);
   oneOf("domainScale", optionValues("domainScale"));
+  oneOf("walls", ["exact", "cubes"]);
+  oneOf("portMode", ["simple", "ports"]);
+  if ("ports" in s) {
+    if (!Array.isArray(s.ports) || s.ports.length > 8) bad("ports");
+    out.ports = s.ports.map((p) => {
+      const ok = p && [0, 1, 2, 3, 4, 5].includes(p.face) && ["feed", "open"].includes(p.type) && Array.isArray(p.point) && p.point.length === 3 && p.point.every((v) => typeof v === "number" && isFinite(v)) && typeof p.speed === "number" && p.speed >= 0 && p.speed <= 1000;
+      if (!ok) bad("ports");
+      return { face: p.face, type: p.type, point: p.point.slice(), speed: p.speed };
+    });
+  }
   oneOf("inletFace", [0, 1, 2, 3, 4, 5]); oneOf("outletFace", [0, 1, 2, 3, 4, 5]);
   oneOf("stlIsFluid", [true, false]);
   oneOf("sliceAxis", [0, 1, 2]);
@@ -816,7 +937,24 @@ function wire() {
   $("meshBtn").addEventListener("click", () => setPreview(!previewOn));
   $("meshEdges").addEventListener("change", () => { if (previewOn) showPreview(); });
   $("cadQuality").addEventListener("change", () => { if (lastFile) loadFile({ name: lastFile.name }, lastFile.buffer); });
-  sel("domainScale", "domainScale"); sel("inletFace", "inletFace"); sel("outletFace", "outletFace");
+  sel("domainScale", "domainScale");
+  sel("walls", "walls", String);
+  $("portMode").addEventListener("change", (e) => {
+    state.portMode = e.target.value; syncInputs(true); invalidate();
+    if (state.portMode === "ports" && !openings.length) findOpenings();
+  });
+  $("findPorts").addEventListener("click", findOpenings);
+  $("showRim").addEventListener("change", renderPorts);
+  $("portList").addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.dataset.role !== undefined) setPortRole(+t.dataset.role, t.value, 20);
+    else if (t.dataset.speed !== undefined) setPortRole(+t.dataset.speed, "feed", +t.value);
+  });
+  $("portList").addEventListener("pointerover", (e) => {
+    const li = e.target.closest("li"); const i = li ? +li.dataset.i : -1;
+    if (i !== hotPort) { hotPort = i; for (const el of $("portList").children) el.classList.toggle("hot", +el.dataset.i === i); drawPortMarks(); }
+  });
+  $("portList").addEventListener("pointerleave", () => { hotPort = -1; for (const el of $("portList").children) el.classList.remove("hot"); drawPortMarks(); }); sel("inletFace", "inletFace"); sel("outletFace", "outletFace");
   sel("stlKind", "stlIsFluid", (v) => v === "fluid");
 
   $("runBtn").addEventListener("click", () => toggleRun());
@@ -878,7 +1016,7 @@ function wire() {
   $("csvBtn").addEventListener("click", () => {
     if (!history.length) { notify("There are no results yet. Press Run first."); return; }
     const keys = Object.keys(history[0]);
-    const units = { t: "time_s", drag: "drag_N", side: "side_N", lift: "lift_N", cd: "Cd", cl: "Cl", loss: "total_pressure_loss_Pa", dp: "static_pressure_drop_Pa", q: "flow_out_m3_per_s", qin: "flow_in_m3_per_s", balance: "mass_out_over_in", peak: "peak_speed_m_per_s" };
+    const units = { t: "time_s", drag: "drag_N", side: "side_N", lift: "lift_N", cd: "Cd", cl: "Cl", loss: "total_pressure_loss_Pa", dp: "static_pressure_drop_Pa", q: "flow_out_m3_per_s", qin: "flow_in_m3_per_s", balance: "mass_out_over_in", fed: "air_fed_m3_per_s", drawn: "air_drawn_in_m3_per_s", out: "air_out_m3_per_s", ratio: "amplification", peak: "peak_speed_m_per_s" };
     const lines = [keys.map((k) => units[k] || k).join(",")].concat(history.map((r) => keys.map((k) => r[k]).join(",")));
     downloadText("flowbench-results.csv", lines.join("\n"), "text/csv");
   });
@@ -887,6 +1025,39 @@ function wire() {
     downloadText("flowbench-setup.json", JSON.stringify(out, null, 2), "application/json");
   });
   $("loadBtn").addEventListener("click", () => $("setupFile").click());
+  // Optional: solve the same case with OpenFOAM through the local runner.
+  let foamBusy = false, foamCancel = false;
+  try { $("foamToken").value = localStorage.getItem("flowbench-foam-token") || ""; } catch (e) { /* storage may be unavailable */ }
+  $("foamToken").addEventListener("change", (e) => { try { localStorage.setItem("flowbench-foam-token", e.target.value.trim()); } catch (err) { /* ignore */ } });
+  $("foamStop").addEventListener("click", () => { foamCancel = true; });
+  $("foamRun").addEventListener("click", async () => {
+    if (foamBusy || !tris) return;
+    const token = $("foamToken").value.trim();
+    const st = await runnerStatus();
+    if (!st) { notify("The OpenFOAM runner is not running on this computer. Start server/flowbench_openfoam_server.py from the repo, then try again.", true); return; }
+    if (!st.openfoam) { notify("The runner is running but could not find OpenFOAM. Install OpenFOAM and restart the runner.", true); return; }
+    if (!token) { notify("Paste the access code that the runner printed when it started.", true); return; }
+    foamBusy = true; foamCancel = false; $("foamRun").disabled = true; $("foamStop").disabled = false;
+    try {
+      const run = await solveWithOpenFoam(tris, options(), { rho: state.rho, mu: state.mu, speed: state.speed }, token, (t) => { $("foamInfo").textContent = t; }, () => foamCancel);
+      showFoamResult(run);
+      $("foamInfo").textContent = "OpenFOAM finished after " + run.results.time + " iterations on " + fmtBig(run.cells) + " cells. The numbers are in the table under the readouts.";
+    } catch (e) { $("foamInfo").textContent = "OpenFOAM: " + e.message; notify("OpenFOAM: " + e.message, true); }
+    foamBusy = false; $("foamRun").disabled = false; $("foamStop").disabled = true;
+  });
+  // The same setup as an OpenFOAM case (snappyHexMesh + simpleFoam), to run on your own machine.
+  $("foamBtn").addEventListener("click", () => {
+    if (!tris) return;
+    try {
+      const c = buildCase(tris, options(), { rho: state.rho, mu: state.mu, speed: state.speed });
+      const entries = {};
+      for (const [path, data] of Object.entries(c.files)) entries["flowbench-openfoam/" + path] = typeof data === "string" ? strToU8(data) : data;
+      const url = URL.createObjectURL(new Blob([zipSync(entries)], { type: "application/zip" }));
+      download("flowbench-openfoam-case.zip", url);
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      notify("OpenFOAM case saved. Unzip it and run: sh Allrun (needs OpenFOAM installed; see README.txt inside). Mesh: " + c.summary.background.join(" x ") + " background cells refined to " + fmt(c.summary.surfaceCell * 1000) + " mm at the surface.");
+    } catch (e) { notify("The OpenFOAM case could not be written: " + e.message, true); }
+  });
   $("setupFile").addEventListener("change", async (e) => {
     const f = e.target.files[0]; e.target.value = "";
     if (!f) return;

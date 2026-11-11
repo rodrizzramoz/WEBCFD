@@ -128,7 +128,14 @@ export function makeSeeds(grid) {
       }
     }
   } else {
-    const nbr = grid.inletNbr, { nx, ny } = grid;
+    // start lines at the inlet, or at every port in custom port mode
+    let nbr = grid.inletNbr;
+    const { nx, ny } = grid;
+    if (grid.ports) {
+      const all = [];
+      for (const p of grid.ports) { const take = Math.min(p.nbr.length, p.type === "feed" ? 60 : 90), st = p.nbr.length / take; for (let s = 0; s < take; s++) all.push(p.nbr[Math.floor(s * st + st / 2)]); }
+      nbr = all;
+    }
     const want = Math.min(140, nbr.length), stepN = nbr.length / want;
     for (let s = 0; s < want; s++) {
       const c = nbr[Math.floor(s * stepN + stepN / 2)];
@@ -219,4 +226,14 @@ export function internalMetrics(grid, m) {
   // Static drop alone also counts kinetic energy that is still in the jet at the outlet.
   const loss = qin > 1e-12 && qout > 1e-12 ? tin / qin - tout / qout : 0;
   return { dp: pin / grid.inletNbr.length - pout / grid.outletNbr.length, loss, qin, qout, balance: min !== 0 ? mout / min : 0 };
+}
+
+// Flow through each custom port, in lattice units. q is positive into the domain.
+export function portMetrics(grid, m) {
+  return grid.ports.map((p) => {
+    let q = 0, pr = 0;
+    const nr = p.normal;
+    for (const c of p.nbr) { const o = 4 * c; q += m[o + 1] * nr[0] + m[o + 2] * nr[1] + m[o + 3] * nr[2]; pr += (m[o] - 1) / 3; }
+    return { q, p: pr / p.nbr.length };
+  });
 }

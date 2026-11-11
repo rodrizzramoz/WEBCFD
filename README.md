@@ -11,6 +11,9 @@
 - **Units and orientation:** unit choice (mm, cm, m, inch) and 90 degree rotations. Four built-in examples.
 - **Flow around a part (external):** the part sits in a virtual wind tunnel with flow along +X. Reports drag, lift and side force in newtons, plus Cd and Cl on the frontal area.
 - **Flow through a part (internal):** pick an inlet face and an outlet face of the bounding box. Reports pressure drop, flow rate, peak speed and mass balance. The STL can be the solid part (flow goes through its holes) or the fluid volume itself.
+- **Custom ports:** for parts with several openings, such as an air mover fed by a compressed-air nozzle. Every opening is found and listed; set each one to air fed in (with a speed), open to atmosphere, or wall. Reports air drawn in and the amplification ratio, with a table of flow and pressure per opening.
+- **Wall shape:** walls can follow the true triangle surface (interpolated bounce-back using the exact distance from each cell to the surface) or use plain cube steps, which is faster and fine for a quick look.
+- **OpenFOAM:** the current setup can be exported as a ready-to-run OpenFOAM case (snappyHexMesh mesh snapped to the real surface, simpleFoam), or solved by OpenFOAM directly from the page through the small local runner in `server/`.
 - **Real units:** air, water, hydraulic oil or a custom fluid; speeds in m/s; results in N, Pa and L/min.
 - **Live 3D results while it solves:** slice plane (speed or pressure), streamlines, surface pressure, optional time averaging, and a history chart.
 - **Export:** screenshot (PNG), result history (CSV), setup (JSON, reloadable).
@@ -28,6 +31,19 @@ Checks: a 100 x 20 x 20 mm cantilever with an end load matches beam theory to wi
 Limits: small deflections, one isotropic material, no buckling, fatigue, contact or bolt preload. It runs on the CPU, so grids above roughly 50,000 elements are slow.
 
 See `docs/ACCURACY.md` for a researched review of how accurate the flow solver is and what would improve it.
+
+## OpenFOAM
+
+OpenFOAM cannot run inside a browser tab, so there are two ways to use it with the same setup:
+
+1. **Export:** the "OpenFOAM case" button saves a zip. Unzip it and run `sh Allrun`. The README inside explains where the results are.
+2. **Local runner:** run `python3 server/flowbench_openfoam_server.py` on the computer that has OpenFOAM. It prints an access code. Paste the code into the flow page and press "Solve with OpenFOAM". The page sends the case, the runner meshes and solves it, and the flow rates, pressures and pressure force come back into a table under the readouts.
+
+The runner listens on 127.0.0.1 only, needs the access code on every request, accepts only a fixed list of OpenFOAM dictionary files, rejects any file that could run code, and runs a fixed list of commands. It uses only the Python standard library.
+
+Both were checked against OpenFOAM v1912 (the Ubuntu package). In that particular package every function object fails at start-up, so the export's built-in reporting block (force coefficients, patch flow rates) could not be exercised there; the runner does not use it and computes the numbers from the written fields instead. On Windows, OpenFOAM needs WSL or Docker.
+
+The exported case is steady and incompressible. A compressed-air jet near the speed of sound needs a compressible solver and pressure boundary conditions; the case README says which.
 
 ## Run it
 
@@ -50,6 +66,9 @@ Needs a browser with WebGPU: current Chrome, Edge, Firefox or Safari on a machin
 | `src/solver.js` | Lattice Boltzmann solver as a WebGPU compute shader: D3Q19 lattice, regularised BGK collision, Smagorinsky sub-grid turbulence model, halfway bounce-back walls, wall forces by momentum exchange. |
 | `src/results.js` | Slice images, streamlines, surface colours and internal flow metrics from the solver output. |
 | `src/viewer.js` | three.js scene. |
+| `src/walls.js` | Exact distance from near-wall cells to the triangle surface, for the true-surface wall option. |
+| `src/openfoam.js`, `src/foamrun.js` | OpenFOAM case writer and the client for the local runner. |
+| `server/flowbench_openfoam_server.py` | Optional local service that runs OpenFOAM for the page. |
 | `src/main.js` | UI, unit conversion, run loop, readouts, export. |
 | `src/fea/core.js` | Finite element solver and topology optimiser (no browser dependencies). |
 | `src/fea/worker.js` | Runs the solver off the main thread. |

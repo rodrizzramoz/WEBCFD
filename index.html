@@ -97,7 +97,21 @@
           </div>
         </div>
         <div id="internalOpts" hidden>
-          <div class="two">
+          <div class="field">
+            <label for="portMode">Openings</label>
+            <select id="portMode">
+              <option value="simple">Simple: one inlet face, one outlet face</option>
+              <option value="ports">Custom: set each opening (air jets, several inlets)</option>
+            </select>
+          </div>
+          <div id="portsBox" hidden>
+            <button type="button" class="btn" id="findPorts">Find openings</button>
+            <ul class="conds" id="portList"></ul>
+            <label class="check" for="showRim"><input type="checkbox" id="showRim"> Show openings at the edge of the box</label>
+            <p class="small" id="rimNote"></p>
+            <p class="small">Each opening where the flow space meets the outside of the part is listed. Set the one fed with compressed air to "Air fed in" with its speed, and the mouth and exit to "Open to atmosphere". The air drawn in through the open ones is the result. Hover a row to see it in the 3D view.</p>
+          </div>
+          <div class="two" id="simplePorts">
             <div class="field">
               <label for="inletFace">Inlet face</label>
               <select id="inletFace"></select>
@@ -148,6 +162,13 @@
             </select>
           </div>
         </div>
+        <div class="field">
+          <label for="walls">Wall shape</label>
+          <select id="walls">
+            <option value="exact" selected>Follow the true surface (accurate)</option>
+            <option value="cubes">Cube steps (fastest, for visualisation)</option>
+          </select>
+        </div>
         <div class="two">
           <button type="button" class="btn" id="meshBtn" aria-pressed="false">Preview mesh</button>
           <label class="check" for="meshEdges"><input type="checkbox" id="meshEdges" checked> Cell edges</label>
@@ -164,6 +185,18 @@
           <button type="button" class="btn" id="csvBtn">Results CSV</button>
           <button type="button" class="btn" id="saveBtn">Save setup</button>
           <button type="button" class="btn" id="loadBtn">Load setup</button>
+          <button type="button" class="btn" id="foamBtn">OpenFOAM case</button>
+        </div>
+        <div class="field">
+          <label for="foamToken">Solve with OpenFOAM on this computer (optional)</label>
+          <input type="text" id="foamToken" placeholder="Access code from the runner" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="two">
+          <button type="button" class="btn" id="foamRun">Solve with OpenFOAM</button>
+          <button type="button" class="btn" id="foamStop" disabled>Stop</button>
+        </div>
+        <p class="small" id="foamInfo">Start server/flowbench_openfoam_server.py from the repo on this computer, then paste the access code it prints. The case is meshed to the real surface and solved by OpenFOAM, and the numbers appear under the readouts.</p>
+        <div hidden>
         </div>
         <input type="file" id="setupFile" accept=".json,application/json" hidden>
       </section>
