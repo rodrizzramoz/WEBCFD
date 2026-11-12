@@ -237,3 +237,31 @@ export function portMetrics(grid, m) {
     return { q, p: pr / p.nbr.length };
   });
 }
+
+// A coarser stand-in for a very large grid, matching the solver's coarse drawing copy:
+// each view cell covers a block of s x s x s real cells and is solid only if they all are.
+export function viewGrid(grid, s) {
+  if (s <= 1) return grid;
+  const nx = Math.ceil(grid.nx / s), ny = Math.ceil(grid.ny / s), nz = Math.ceil(grid.nz / s);
+  const flags = new Uint8Array(nx * ny * nz).fill(SOLID), f = grid.flags;
+  for (let k = 0; k < grid.nz; k++) for (let j = 0; j < grid.ny; j++) {
+    const row = grid.nx * (j + grid.ny * k), vrow = nx * (((j / s) | 0) + ny * ((k / s) | 0));
+    for (let i = 0; i < grid.nx; i++) if ((f[row + i] & 7) !== SOLID) flags[vrow + ((i / s) | 0)] = FLUID;
+  }
+  return { ...grid, nx, ny, nz, n: nx * ny * nz, dx: grid.dx * s, flags, stride: s };
+}
+
+// The cells whose exact values the readouts need, and a copy of the grid whose
+// cell lists point into that short list instead of into the full grid.
+export function samplePlan(grid) {
+  const lists = grid.ports ? grid.ports.map((p) => p.nbr) : grid.inletNbr ? [grid.inletNbr, grid.outletNbr] : [];
+  let total = 0;
+  for (const l of lists) total += l.length;
+  const cells = new Uint32Array(total), ranges = [];
+  let o = 0;
+  for (const l of lists) { cells.set(l, o); ranges.push(Uint32Array.from(l, (_, k) => o + k)); o += l.length; }
+  const mgrid = { ...grid };
+  if (grid.ports) mgrid.ports = grid.ports.map((p, i) => ({ ...p, nbr: ranges[i] }));
+  else if (grid.inletNbr) { mgrid.inletNbr = ranges[0]; mgrid.outletNbr = ranges[1]; }
+  return { cells, mgrid };
+}

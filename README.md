@@ -6,7 +6,7 @@
 
 - **Models:** STEP, IGES and BREP CAD files (read with OpenCascade compiled to WebAssembly, loaded only when needed), plus STL, OBJ and 3MF meshes, by file picker or drag and drop. CAD files have a surface detail setting, and on the structure page their real CAD faces are what you click.
 - **Mesh preview:** both pages can show the exact cell model the solver will use before you run anything, with cell edges, a cell count, and a warning when the part is too coarse.
-- **Grid detail:** presets plus a custom value, up to whatever your GPU memory allows on the flow page.
+- **Grid detail:** presets plus a custom value. The flow solver splits its storage over several GPU buffers, so the ceiling is about 100 million cells on a GPU with a 4 GB buffer limit (roughly 172 bytes per cell in total). Above 6 million cells the 3D view is drawn from a coarser averaged copy while the solve and the readouts stay at full detail.
 - **Interactive tools on the flow page:** hover probe on the slice, Shift + click smoke wand, live speed and fluid changes, click to pick inlet and outlet faces, yaw angle, replay timeline.
 - **Units and orientation:** unit choice (mm, cm, m, inch) and 90 degree rotations. Four built-in examples.
 - **Flow around a part (external):** the part sits in a virtual wind tunnel with flow along +X. Reports drag, lift and side force in newtons, plus Cd and Cl on the frontal area.

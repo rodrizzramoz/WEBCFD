@@ -10,7 +10,7 @@ import { Viewer } from "./viewer.js";
 import { Solver } from "./solver.js";
 import { DEMOS } from "./demos.js";
 import { buildDomain, domainBox, FACE_NAMES, NORMALS, scanOpenings, matchPort } from "./domain.js";
-import { portMetrics, fieldStats, sliceImage, streamlines, makeSeeds, surfaceColors, internalMetrics, probe, seedCluster, LUT_CSS } from "./results.js";
+import { viewGrid, samplePlan, portMetrics, fieldStats, sliceImage, streamlines, makeSeeds, surfaceColors, internalMetrics, probe, seedCluster, LUT_CSS } from "./results.js";
 
 const $ = (id) => document.getElementById(id);
 const FLUIDS = {
@@ -34,6 +34,7 @@ let tris = null;
 let solver = null, grid = null, lat = null, seeds = null;
 let prepared = false, running = false, runToken = 0, loopPromise = null, busy = false;
 let last = null, avgField = null;
+let vg = null, mgrid = null;   // grid the drawing uses (coarser on very large grids), and the readout cell lists
 let ranges = { sp: 0, pLo: 0, pHi: 0 };
 let history = [];
 let smooth = null;
@@ -306,7 +307,8 @@ function showFacts(dims, dx, cells, l) {
     ["Cells", fmtBig(cells)],
     ["Cell size", fmt(dx * 1000) + " mm"],
     ["Part size in cells", tris ? partCells(dx) : "-"],
-    ["GPU memory", fmt(Solver.memoryBytes(cells) / 1048576) + " MB"],
+    ["GPU memory", Solver.memoryBytes(cells) >= 1073741824 ? fmt(Solver.memoryBytes(cells) / 1073741824) + " GB" : fmt(Solver.memoryBytes(cells) / 1048576) + " MB"],
+    ...(Solver.strideFor(cells) > 1 ? [["Drawn at", "1/" + Solver.strideFor(cells) + " detail (solved at full detail)"]] : []),
   ];
   if (l) rows.push(["Time step", fmt(l.dt * 1e6) + " us"], ["Reynolds number", fmtBig(l.reynolds)]);
   if (l && grid && grid.mode === "external") {
@@ -324,11 +326,14 @@ async function prepare() {
   if (state.mode === "internal" && state.inletFace === state.outletFace) throw new Error("The inlet and outlet cannot be the same face.");
   const box = domainBox(tris, options());
   const cells = box.dims[0] * box.dims[1] * box.dims[2];
-  if (cells > solver.maxCells) throw new Error("This grid needs " + fmtBig(cells) + " cells, more than this GPU allows (" + fmtBig(solver.maxCells) + "). Lower the grid detail.");
+  if (cells > solver.maxCells) throw new Error("This grid needs " + fmtBig(cells) + " cells, more than this GPU's buffer limit allows (" + fmtBig(solver.maxCells) + "). Lower the grid detail.");
   grid = buildDomain(tris, options());
   lat = latticeFor(grid);
-  await solver.setup(grid, lat);
-  seeds = makeSeeds(grid);
+  const plan = samplePlan(grid);
+  await solver.setup(grid, lat, plan.cells);
+  // very large grids are drawn from a coarser copy, so the page does not have to copy gigabytes back from the GPU
+  vg = viewGrid(grid, solver.stride); mgrid = plan.mgrid;
+  seeds = makeSeeds(grid).map((v) => v / solver.stride);
   viewer.setDomain(box, state.mode, state.inletFace, state.outletFace);
   showFacts(box.dims, box.dx, cells, lat);
   history = []; smooth = null; last = null; avgField = null;
@@ -473,7 +478,7 @@ function renderPortTable(show) {
 // ---------- Run loop ----------
 async function runLoop(token) {
   let k = 2, lastRead = performance.now() - 150;
-  const readEvery = 250 + grid.n / 1e6 * 220;
+  const readEvery = 250 + vg.n / 1e6 * 220;
   try {
     while (running && token === runToken) {
       const t0 = performance.now();
@@ -506,7 +511,9 @@ async function stopLoop() {
 }
 
 function ingest(data) {
-  const st = fieldStats(grid, data.macro);
+  const st = fieldStats(vg, data.macro);
+  // readouts use exact cell values: the whole field on normal grids, the picked cells on very large ones
+  const mg = data.sample ? mgrid : grid, mm = data.sample || data.macro;
   if (st.bad) {
     running = false; prepared = false;
     $("runBtn").textContent = "Run";
@@ -542,7 +549,7 @@ function ingest(data) {
     const qA = 0.5 * state.rho * state.speed ** 2 * grid.frontalArea;
     row = { t, drag: f[0], side: f[1], lift: f[2], cd: f[0] / qA, cl: f[2] / qA };
   } else if (grid.portMode) {
-    const pm = portMetrics(grid, data.macro), toQ = lat.vel * grid.dx * grid.dx;
+    const pm = portMetrics(mg, mm), toQ = lat.vel * grid.dx * grid.dx;
     let fed = 0, drawn = 0, out = 0;
     pm.forEach((m, i) => {
       const q = m.q * toQ;
@@ -553,7 +560,7 @@ function ingest(data) {
     const simIn = pm.reduce((a, m, i) => a + (grid.ports[i].type === "feed" || m.q > 0 ? m.q * toQ : 0), 0);
     row = { t, fed, drawn, out, ratio: fed > 0 ? drawn / fed : 0, balance: simIn > 0 ? out / simIn : 0, peak: st.vmax * lat.vel };
   } else {
-    const im = internalMetrics(grid, data.macro);
+    const im = internalMetrics(mg, mm);
     const toQ = lat.vel * grid.dx * grid.dx;
     row = { t, loss: im.loss * lat.pres, dp: im.dp * lat.pres, q: im.qout * toQ, qin: im.qin * toQ, balance: im.balance, peak: st.vmax * lat.vel };
   }
@@ -583,7 +590,7 @@ function updateLegend() {
 function allSeeds(m) {
   if (!smoke.length) return seeds;
   const out = seeds.slice();
-  for (const p of smoke) for (const v of seedCluster(grid, m, p)) out.push(v);
+  for (const p of smoke) for (const v of seedCluster(vg, m, p)) out.push(v);
   return out;
 }
 
@@ -591,20 +598,20 @@ function allSeeds(m) {
 function updateViz(record) {
   if (!last || !prepared) return;
   const m = avgField || last;
-  const dims = [grid.nx, grid.ny, grid.nz];
+  const dims = [vg.nx, vg.ny, vg.nz];
   if ($("showSlice").checked) {
     const a = state.sliceAxis;
     const idx = Math.max(1, Math.min(dims[a] - 2, Math.round(state.slicePos * (dims[a] - 1))));
     const isP = state.field === "pressure";
-    const img = sliceImage(grid, m, a, idx, state.field, isP ? ranges.pLo : 0, isP ? ranges.pHi : ranges.sp);
+    const img = sliceImage(vg, m, a, idx, state.field, isP ? ranges.pLo : 0, isP ? ranges.pHi : ranges.sp);
     sliceShown = { axis: a, idx };
     if (record === true) tlPush(img, simTime());
     const past = tl.view >= 0 ? tl.frames[tl.view] : null;
-    viewer.setSlice(grid, a, idx, past ? past.img : img);
+    viewer.setSlice(vg, a, idx, past ? past.img : img);
   } else { viewer.hideSlice(); sliceShown = null; }
-  viewer.setStreamlines($("showLines").checked ? streamlines(grid, m, allSeeds(m), 0, ranges.sp, seeds.length) : null);
+  viewer.setStreamlines($("showLines").checked ? streamlines(vg, m, allSeeds(m), 0, ranges.sp, seeds.length) : null);
   if ($("showSurf").checked) {
-    viewer.setSurfaceColors(surfaceColors(grid, m, baked.getAttribute("position").array, baked.getAttribute("normal").array, ranges.pLo, ranges.pHi));
+    viewer.setSurfaceColors(surfaceColors(vg, m, baked.getAttribute("position").array, baked.getAttribute("normal").array, ranges.pLo, ranges.pHi));
   } else viewer.setSurfaceColors(null);
   updateLegend();
   tlRender();
@@ -618,7 +625,7 @@ function refreshProbe() {
   if (!pointer || pointer.down || !last || !prepared || !sliceShown) return hide();
   const hit = viewer.pickSlice(pointer.x, pointer.y);
   if (!hit) return hide();
-  const pr = probe(grid, avgField || last, hit, sliceShown.axis, sliceShown.idx);
+  const pr = probe(vg, avgField || last, hit, sliceShown.axis, sliceShown.idx);
   if (!pr) return hide();
   el.textContent = fmt(pr.speed * lat.vel) + " m/s\n" + fmt(pr.pressure * lat.pres) + " Pa";
   el.hidden = false;
@@ -632,7 +639,7 @@ function refreshProbe() {
 function addSmoke(e) {
   if (!last || !prepared) { notify("Press Run first. Smoke follows the solved flow."); return; }
   let p = viewer.pickSlice(e.clientX, e.clientY);
-  if (!p || !probe(grid, last, p)) {
+  if (!p || !probe(vg, last, p)) {
     const q = viewer.pickInlet(e.clientX, e.clientY);
     if (q) {
       // step a few cells in from the inlet face, where the flow is defined
@@ -640,7 +647,7 @@ function addSmoke(e) {
       p = [q[0] + n[0] * 2.5 * grid.dx, q[1] + n[1] * 2.5 * grid.dx, q[2] + n[2] * 2.5 * grid.dx];
     }
   }
-  if (!p || !probe(grid, last, p)) { notify("No smoke released: Shift + click on a coloured part of the slice or on the green inlet face."); return; }
+  if (!p || !probe(vg, last, p)) { notify("No smoke released: Shift + click on a coloured part of the slice or on the green inlet face."); return; }
   smoke.push(p);
   if (smoke.length > 40) smoke.shift();
   $("showLines").checked = true;
@@ -691,7 +698,7 @@ function tlRender() {
 // Puts the chosen stored image (or the live one) on the slice plane.
 function tlShow() {
   const f = tl.view >= 0 ? tl.frames[tl.view] : null;
-  if (f && sliceShown && prepared && grid) viewer.setSlice(grid, sliceShown.axis, sliceShown.idx, f.img);
+  if (f && sliceShown && prepared && vg) viewer.setSlice(vg, sliceShown.axis, sliceShown.idx, f.img);
   else if (!f) updateViz(false);
   tlRender();
 }
@@ -1135,7 +1142,7 @@ async function start() {
   }
   loadDemo("ahmed");
   window.flowbench = {
-    state, get grid() { return grid; }, get lat() { return lat; }, get history() { return history; }, get solver() { return solver; },
+    state, get grid() { return grid; }, get lat() { return lat; }, get history() { return history; }, get solver() { return solver; }, get viewGrid() { return vg; }, Solver,
     get last() { return last; }, get smoke() { return smoke; }, get timeline() { return tl; }, viewer, loadDemo, toggleRun,
   };
   if (solver) toggleRun();

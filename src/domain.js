@@ -85,6 +85,14 @@ function bounds(tris) {
   return { min, max, size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]] };
 }
 
+// A first-in first-out list of cell numbers held in a typed array, so flood fills
+// over tens of millions of cells do not need a huge ordinary array.
+function cellQueue(n) {
+  const data = new Int32Array(n);
+  let len = 0;
+  return { push(v) { data[len++] = v; }, at(h) { return data[h]; }, get length() { return len; } };
+}
+
 // Domain box for the current setup, without voxelising. Used for the live preview.
 export function domainBox(tris, opt) {
   const bb = bounds(tris);
@@ -216,14 +224,14 @@ export function buildDomain(tris, opt) {
   if (!outOpen.length) throw new Error("No opening found on the outlet face (" + FACE_NAMES[opt.outletFace] + "). Pick another face or rotate the model.");
 
   const reached = new Uint8Array(n);
-  const queue = [];
+  const queue = cellQueue(n);
   const sIn = step(opt.inletFace), sOut = step(opt.outletFace);
   for (const c of inOpen) {
     const q = c + sIn;
     if (interior(q) && isOpen(q) && !reached[q]) { reached[q] = 1; queue.push(q); }
   }
   for (let h = 0; h < queue.length; h++) {
-    const c = queue[h];
+    const c = queue.at(h);
     for (let a = 0; a < 3; a++) {
       for (const q of [c - stride[a], c + stride[a]]) {
         if (!reached[q] && interior(q) && isOpen(q)) { reached[q] = 1; queue.push(q); }
@@ -231,7 +239,7 @@ export function buildDomain(tris, opt) {
     }
   }
   flags.fill(SOLID);
-  for (const c of queue) flags[c] = FLUID;
+  for (let h = 0; h < queue.length; h++) flags[queue.at(h)] = FLUID;
   const inletNbr = [], outletNbr = [];
   for (const c of inOpen) if (reached[c + sIn]) { flags[c] = INLET | (opt.inletFace << 3); inletNbr.push(c + sIn); }
   for (const c of outOpen) if (reached[c + sOut]) { flags[c] = OUTLET | (opt.outletFace << 3); outletNbr.push(c + sOut); }
@@ -239,7 +247,8 @@ export function buildDomain(tris, opt) {
 
   // Narrowest cross-section along the inlet axis, to keep the fastest flow inside the solver's speed limit.
   const a = opt.inletFace >> 1, slices = new Uint32Array(box.dims[a]);
-  for (const c of queue) {
+  for (let h = 0; h < queue.length; h++) {
+    const c = queue.at(h);
     const p = a === 0 ? c % nx : a === 1 ? ((c / nx) | 0) % ny : (c / (nx * ny)) | 0;
     slices[p]++;
   }
@@ -342,7 +351,7 @@ function buildPorts(grid, tris, opt, box, isOpen) {
     const i = c % nx, j = ((c / nx) | 0) % ny, k = (c / (nx * ny)) | 0;
     return i > 0 && j > 0 && k > 0 && i < nx - 1 && j < ny - 1 && k < nz - 1;
   };
-  const reached = new Uint8Array(n), queue = [];
+  const reached = new Uint8Array(n), queue = cellQueue(n);
   for (const p of ports) {
     const nrm = NORMALS[p.face];
     p.step = nrm[0] * stride[0] + nrm[1] * stride[1] + nrm[2] * stride[2];
@@ -352,13 +361,13 @@ function buildPorts(grid, tris, opt, box, isOpen) {
     }
   }
   for (let h = 0; h < queue.length; h++) {
-    const c = queue[h];
+    const c = queue.at(h);
     for (let a = 0; a < 3; a++) for (const q of [c - stride[a], c + stride[a]]) {
       if (!reached[q] && interior(q) && isOpen(q)) { reached[q] = 1; queue.push(q); }
     }
   }
   flags.fill(SOLID);
-  for (const c of queue) flags[c] = FLUID;
+  for (let h = 0; h < queue.length; h++) flags[queue.at(h)] = FLUID;
   grid.ports = ports.map((p, id) => {
     const nbr = [];
     for (const c of p.opening.cells) if (reached[c + p.step]) { flags[c] = (p.type === "feed" ? INLET : OUTLET) | (p.face << 3) | (id << 6); nbr.push(c + p.step); }

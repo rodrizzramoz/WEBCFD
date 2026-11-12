@@ -41,5 +41,35 @@ window.run = async (demo, res, nsteps, every, opts = {}) => {
   }
   return out;
 };
+// Checks the coarse drawing copy and the picked cells against a full readback of the same run.
+window.viewCheck = async (demo, res, nsteps) => {
+  const { viewGrid, samplePlan } = await import("/src/results.js");
+  const d = DEMOS[demo];
+  let g = d.build(); if (g.index) g = g.toNonIndexed(); g.scale(0.001, 0.001, 0.001);
+  const tris = g.getAttribute("position").array;
+  const o = { mode: d.setup.mode, res, domainScale: 1, inletFace: d.setup.inletFace, outletFace: d.setup.outletFace, stlIsFluid: d.setup.stlIsFluid, walls: "exact", portMode: d.setup.portMode || "simple", ports: d.setup.ports || [] };
+  const grid = buildDomain(tris, o), uLat = 0.05;
+  const lat = { portU: grid.portMode ? grid.ports.map(p => uLat * p.speed / grid.refSpeed) : [uLat], uin: grid.inVec.map(c => c * uLat), tau: 0.52, smag: 18 * Math.SQRT2 * 0.0144, initWithFlow: grid.mode === "external", rampSteps: 0 };
+  const plan = samplePlan(grid);
+  const run = async (limit) => { Solver.viewCells = limit; const s = await Solver.create(); await s.setup(grid, lat, plan.cells); await s.step(nsteps); const r = await s.read(); r.stride = s.stride; s.dispose(); return r; };
+  const full = await run(1e12), coarse = await run(grid.n / 20);
+  const s = coarse.stride, vg = viewGrid(grid, s);
+  let pickErr = 0;
+  for (let k = 0; k < plan.cells.length; k++) for (let c = 0; c < 4; c++) pickErr = Math.max(pickErr, Math.abs(coarse.sample[4 * k + c] - full.macro[4 * plan.cells[k] + c]));
+  let viewErr = 0, solidMismatch = 0;
+  for (let K = 0; K < vg.nz; K++) for (let J = 0; J < vg.ny; J++) for (let I = 0; I < vg.nx; I++) {
+    const sum = [0, 0, 0, 0]; let cnt = 0;
+    for (let dz = 0; dz < s; dz++) for (let dy = 0; dy < s; dy++) for (let dx = 0; dx < s; dx++) {
+      const i = I * s + dx, j = J * s + dy, k = K * s + dz;
+      if (i >= grid.nx || j >= grid.ny || k >= grid.nz) continue;
+      const c = i + grid.nx * (j + grid.ny * k);
+      if ((grid.flags[c] & 7) !== 1) { for (let q = 0; q < 4; q++) sum[q] += full.macro[4 * c + q]; cnt++; }
+    }
+    const v = I + vg.nx * (J + vg.ny * K);
+    if ((cnt === 0) !== ((vg.flags[v] & 7) === 1)) solidMismatch++;
+    if (cnt) for (let q = 0; q < 4; q++) viewErr = Math.max(viewErr, Math.abs(coarse.macro[4 * v + q] - sum[q] / cnt));
+  }
+  return { dims: [grid.nx, grid.ny, grid.nz], stride: s, viewDims: [vg.nx, vg.ny, vg.nz], picks: plan.cells.length, pickErr, viewErr, solidMismatch, sampleLen: coarse.sample ? coarse.sample.length : 0, viewLen: coarse.macro.length };
+};
 window.ready = true;
 </script></body></html>
