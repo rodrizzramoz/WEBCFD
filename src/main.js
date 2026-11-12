@@ -3,7 +3,8 @@ import * as THREE from "three";
 import { readModel, toGeometry, isCad, FORMATS_TEXT } from "./io.js";
 import { voxelSkin } from "./fea/mesh.js";
 import { buildCase } from "./openfoam.js";
-import { nozzle, FLOW_UNITS, BAR, PSI } from "./airjet.js";
+import { nozzle, FLOW_UNITS, BAR, PSI, RHO_AIR } from "./airjet.js";
+import { GasEngine, gasLattice } from "./gasrun.js";
 import { runnerStatus, solveWithOpenFoam, describe } from "./foamrun.js";
 import { zipSync, strToU8 } from "three/addons/libs/fflate.module.js";
 import { Viewer } from "./viewer.js";
@@ -25,13 +26,13 @@ const MAX_SPEED = 1000; // m/s, far beyond where treating the fluid as incompres
 const state = {
   name: "ahmed", demo: "ahmed", unit: 0.001, mode: "external", fluid: "air", rho: 1.204, mu: 1.825e-5,
   speed: 40, res: 128, domainScale: 1, inletFace: 0, outletFace: 1, stlIsFluid: false,
-  sliceAxis: 1, slicePos: 0.5, field: "speed", walls: "exact", yaw: 0, portMode: "simple", ports: [], flowUnit: "m3h",
+  sliceAxis: 1, slicePos: 0.5, field: "speed", walls: "exact", yaw: 0, portMode: "simple", ports: [], flowUnit: "m3h", gasModel: "lbm",
 };
 let source = null;            // geometry as loaded, in file units
 const rot = new THREE.Matrix4();
 let baked = null;             // geometry in metres, as simulated
 let tris = null;
-let solver = null, grid = null, lat = null, seeds = null;
+let lbm = null, gasEngine = null, solver = null, grid = null, lat = null, seeds = null;
 let prepared = false, running = false, runToken = 0, loopPromise = null, busy = false;
 let last = null, avgField = null;
 let vg = null, mgrid = null;   // grid the drawing uses (coarser on very large grids), and the readout cell lists
@@ -226,7 +227,11 @@ function options() {
   };
 }
 
+function gasRun() { return state.mode === "internal" && state.portMode === "ports" && state.gasModel === "gas"; }
+function engineClass() { return gasRun() ? GasEngine : Solver; }
+
 function latticeFor(g) {
+  if (gasRun()) return gasLattice(g, state.mu);
   // In custom port mode the fastest fed port sets the scale; every other port is a fraction of it.
   const nu = state.mu / state.rho, U = g.portMode ? g.refSpeed : state.speed, dx = g.dx;
   let uLat = Math.min(0.07, 0.11 / g.speedUp) * speedLimit;
@@ -302,15 +307,17 @@ function partCells(dx) {
 }
 
 function showFacts(dims, dx, cells, l) {
+  const E = engineClass();
   const rows = [
     ["Grid", dims.join(" x ")],
     ["Cells", fmtBig(cells)],
     ["Cell size", fmt(dx * 1000) + " mm"],
     ["Part size in cells", tris ? partCells(dx) : "-"],
-    ["GPU memory", Solver.memoryBytes(cells) >= 1073741824 ? fmt(Solver.memoryBytes(cells) / 1073741824) + " GB" : fmt(Solver.memoryBytes(cells) / 1048576) + " MB"],
-    ...(Solver.strideFor(cells) > 1 ? [["Drawn at", "1/" + Solver.strideFor(cells) + " detail (solved at full detail)"]] : []),
+    ["GPU memory", E.memoryBytes(cells) >= 1073741824 ? fmt(E.memoryBytes(cells) / 1073741824) + " GB" : fmt(E.memoryBytes(cells) / 1048576) + " MB"],
+    ...(E.strideFor(cells) > 1 ? [["Drawn at", "1/" + E.strideFor(cells) + " detail (solved at full detail)"]] : []),
   ];
-  if (l) rows.push(["Time step", fmt(l.dt * 1e6) + " us"], ["Reynolds number", fmtBig(l.reynolds)]);
+  if (l && l.gas) rows.push(["Solver", "Compressible gas"], ["Time step", "set by the speed of sound, about " + fmt(dx / 1500 * 1e6) + " us"]);
+  else if (l) rows.push(["Time step", fmt(l.dt * 1e6) + " us"], ["Reynolds number", fmtBig(l.reynolds)]);
   if (l && grid && grid.mode === "external") {
     // share of the tunnel cross-section the part fills; above about 5 % it inflates drag
     const b = 100 * grid.frontalArea / (dims[1] * dims[2] * dx * dx);
@@ -320,10 +327,15 @@ function showFacts(dims, dx, cells, l) {
 }
 
 async function prepare() {
-  if (!solver) throw new Error("This browser has no WebGPU, so the solver cannot run. Use a current Chrome, Edge or Firefox on a computer with a graphics card.");
+  if (!lbm) throw new Error("This browser has no WebGPU, so the solver cannot run. Use a current Chrome, Edge or Firefox on a computer with a graphics card.");
   if (!(state.speed > 0) || !(state.rho > 0) || !(state.mu > 0)) throw new Error("Speed, density and viscosity must all be above zero.");
   if (state.speed > MAX_SPEED) throw new Error("Speeds above " + MAX_SPEED + " m/s are outside what this solver can represent. Lower the speed.");
   if (state.mode === "internal" && state.inletFace === state.outletFace) throw new Error("The inlet and outlet cannot be the same face.");
+  const gas = gasRun();
+  if (gas && !gasEngine) gasEngine = await GasEngine.create();
+  // only one solver holds GPU memory at a time
+  if (solver && solver !== (gas ? gasEngine : lbm)) solver.dispose();
+  solver = gas ? gasEngine : lbm;
   const box = domainBox(tris, options());
   const cells = box.dims[0] * box.dims[1] * box.dims[2];
   if (cells > solver.maxCells) throw new Error("This grid needs " + fmtBig(cells) + " cells, more than this GPU's buffer limit allows (" + fmtBig(solver.maxCells) + "). Lower the grid detail.");
@@ -340,6 +352,12 @@ async function prepare() {
   timeBase = 0; stepBase = 0; sliceShown = null; tlClear();
   ranges = { sp: lat.uLat * 1.4, pLo: 0, pHi: 0 };
   prepared = true;
+  if (gas) {
+    const feeds = grid.ports.filter((p) => p.type === "feed");
+    if (!feeds.length) return "No port is fed, so nothing drives the flow. Set one opening to Fed.";
+    const small = Math.min(...feeds.map((p) => p.area / (grid.dx * grid.dx)));
+    if (small < 50) return "The smallest fed opening is only about " + fmt(Math.sqrt(small * 4 / Math.PI)) + " cells across. The fed flow is still right for that area, but the air drawn in is rough below about 8 cells across: raise the grid detail.";
+  }
   // Rays that enter the surface without leaving it mean the mesh has gaps.
   if (grid.openColumns > Math.max(2, 0.01 * grid.hitColumns)) {
     return "This STL is not watertight (its surface has gaps), so the solver's copy of the shape may be wrong. Repair the mesh for results you can trust.";
@@ -351,13 +369,13 @@ async function prepare() {
   return "";
 }
 
-function simTime() { return timeBase + (solver.steps - stepBase) * lat.dt; }
+function simTime() { return lat.gas ? solver.time : timeBase + (solver.steps - stepBase) * lat.dt; }
 
 // Speed or fluid changed. If a run is prepared it carries on with the same grid and the
 // same flow state: only the relaxation time and the conversion to real units change.
 function flowChanged(dragging) {
   const ok = state.speed > 0 && state.speed <= MAX_SPEED && state.rho > 0 && state.mu > 0 && isFinite(state.speed) && isFinite(state.rho) && isFinite(state.mu);
-  if (!prepared || !grid || !solver || !ok) { invalidate(); return; }
+  if (!prepared || !grid || !solver || !ok || lat.gas || gasRun()) { invalidate(); return; }
   setupVersion++;
   const now = simTime(), old = lat;
   lat = latticeFor(grid);
@@ -470,9 +488,10 @@ function renderPortTable(show) {
   }
   box.hidden = !(show && lastPorts && prepared);
   if (box.hidden) return;
-  box.innerHTML = '<table class="porttable"><tr><th>Opening</th><th>Role</th><th>Flow, " + FLOW_UNITS[state.flowUnit].label + "</th><th>Mean speed, m/s</th><th>Pressure, Pa</th></tr>' +
+  const gasT = !!(lat && lat.gas); // free-air flow over the area is not a real speed for compressed air
+  box.innerHTML = '<table class="porttable"><tr><th>Opening</th><th>Role</th><th>Flow, ' + FLOW_UNITS[state.flowUnit].label + '</th><th>' + (gasT ? "Mass flow, g/s" : "Mean speed, m/s") + '</th><th>Pressure, Pa</th></tr>' +
     lastPorts.map((r) => "<tr><td>" + FACE_NAMES[r.port.face] + " face, " + fmt(r.port.area * 1e4) + " cm2</td><td>" + (r.port.type === "feed" ? "Air fed in" : r.q >= 0 ? "Open, drawing in" : "Open, blowing out") +
-      "</td><td>" + fmt(Math.abs(r.q) * FLOW_UNITS[state.flowUnit].k) + "</td><td>" + fmt(Math.abs(r.q) / r.port.area) + "</td><td>" + fmt(r.p) + "</td></tr>").join("") + "</table>";
+      "</td><td>" + fmt(Math.abs(r.q) * FLOW_UNITS[state.flowUnit].k) + "</td><td>" + fmt(gasT ? Math.abs(r.q) * RHO_AIR * 1000 : Math.abs(r.q) / r.port.area) + "</td><td>" + fmt(r.p) + "</td></tr>").join("") + "</table>";
 }
 
 // ---------- Run loop ----------
@@ -520,7 +539,7 @@ function ingest(data) {
     notify("The solution went unstable and was stopped. Raise the grid detail or lower the speed, then press Run.", true);
     return false;
   }
-  if (st.vmax > 0.17 && speedLimit > 0.15) {
+  if (!lat.gas && st.vmax > 0.17 && speedLimit > 0.15) {
     // Somewhere the flow is too close to the solver's speed limit to stay accurate.
     // Restart with a shorter time step, which lowers every speed in solver units.
     speedLimit *= Math.min(0.75, 0.11 / st.vmax);
@@ -548,6 +567,17 @@ function ingest(data) {
     const f = data.force.map((v) => v * lat.force);
     const qA = 0.5 * state.rho * state.speed ** 2 * grid.frontalArea;
     row = { t, drag: f[0], side: f[1], lift: f[2], cd: f[0] / qA, cl: f[2] / qA };
+  } else if (lat.gas) {
+    // port flows are summed on the GPU as mass flow; shown as free air (at room conditions)
+    const g = data.gas;
+    let fed = 0, drawn = 0, out = 0;
+    g.ports.forEach((m, i) => {
+      if (!grid.ports[i]) return;
+      const q = m.massFlow / RHO_AIR;
+      if (grid.ports[i].type === "feed") fed += q; else if (q > 0) drawn += q; else out -= q;
+    });
+    lastPorts = grid.ports.map((port, i) => ({ q: g.ports[i].massFlow / RHO_AIR, p: g.ports[i].meanPressure - 101325, port }));
+    row = { t, fed, drawn, out, ratio: fed > 0 ? drawn / fed : 0, balance: fed + drawn > 0 ? out / (fed + drawn) : 0, peak: st.vmax, mach: g.maxMach };
   } else if (grid.portMode) {
     const pm = portMetrics(mg, mm), toQ = lat.vel * grid.dx * grid.dx;
     let fed = 0, drawn = 0, out = 0;
@@ -573,7 +603,8 @@ function ingest(data) {
   const now = performance.now();
   if (now - rate.t > 800) { rate.value = rate.steps * 1000 / (now - rate.t); rate.steps = 0; rate.t = now; }
   const rampNow = Solver.ramp(solver.steps, lat.rampSteps);
-  $("status").textContent = (rampNow < 1 ? "Starting up gently, inlet at " + Math.round(rampNow * 100) + " % of full speed. " : "") + "Simulated " + fmt(t * 1000) + " ms of flow, step " + solver.steps + ", " +
+  if (lat.gas) rate.dtNow = data.gas.dt;
+  $("status").textContent = (rampNow < 1 ? "Starting up gently, inlet at " + Math.round(rampNow * 100) + (lat.gas ? " % of full pressure. " : " % of full speed. ") : "") + "Simulated " + fmt(t * 1000) + " ms of flow, step " + solver.steps + ", " +
     Math.round(rate.value) + " steps/s, " + fmtBig(rate.value * grid.n) + " cell updates/s";
   return true;
 }
@@ -727,7 +758,7 @@ function renderTiles() {
     ["b", "Amplification", s && "ratio" in s ? fmt(s.ratio) + " x" : "-", "air drawn in per unit of air fed"],
     ["", "Air fed in", lpm("fed"), "free air used by the fed ports"],
     ["", "Air out", lpm("out"), "leaving through the open ports"],
-    ["", "Peak speed", v("peak", "m/s"), "fastest point in the flow"],
+    s && "mach" in s ? ["", "Peak Mach number", fmt(s.mach), "peak speed " + fmt(s.peak) + " m/s; above 1 is supersonic"] : ["", "Peak speed", v("peak", "m/s"), "fastest point in the flow"],
     ["", "Mass balance", s && "balance" in s ? fmt(100 * s.balance) + " %" : "-", "air out against air in"],
   ] : ext ? [
     ["a", "Drag coefficient", v("cd"), grid && prepared ? "Cd, on " + fmt(grid.frontalArea * 1e4) + " cm2 frontal area" : "Cd"],
@@ -826,6 +857,8 @@ function syncInputs(keepGhost) {
   $("internalOpts").hidden = !internal;
   const custom = internal && state.portMode === "ports";
   $("portMode").value = state.portMode;
+  $("gasModel").value = state.gasModel;
+  $("gasRow").hidden = !(internal && state.portMode === "ports");
   $("portsBox").hidden = !custom; $("simplePorts").hidden = custom;
   for (const id of ["speed", "speedSlider"]) $(id).disabled = custom;
   drawPortMarks();
@@ -834,7 +867,9 @@ function syncInputs(keepGhost) {
   $("customFluid").hidden = state.fluid !== "custom";
   $("speedLabel").textContent = internal ? "Inlet speed, m/s" : "Wind speed, m/s";
   $("flowHint").textContent = internal && state.portMode === "ports"
-    ? "Green patches are fed with air, blue patches are open to the surrounding air, grey ones are blocked. Speeds much above 100 m/s are compressible in reality; this solver treats air as incompressible, so a real compressed-air jet is only approximated. Use the OpenFOAM case export for a second opinion."
+    ? (state.gasModel === "gas"
+      ? "Green patches are fed with air, blue patches are open to the surrounding air, grey ones are blocked. The compressible solver handles choked and supersonic jets and gives the right air use for the opening as the grid sees it. It uses cube walls, takes many more steps, and the amount of air drawn in is only rough until the nozzle is about 8 cells across."
+      : "Green patches are fed with air, blue patches are open to the surrounding air, grey ones are blocked. Speeds much above 100 m/s are compressible in reality; this solver treats air as incompressible, so a real compressed-air jet is only approximated. Switch Air model to Compressible gas for jets fed at pressure, or use the OpenFOAM case export for a second opinion.")
     : internal
     ? "Flow enters through the openings on the green face and leaves through the orange face. Every other surface is a wall. Click a face of the box in the 3D view to make it the inlet, or Alt + click to make it the outlet."
     : "Flow runs along +X, from the green face to the orange face. Rotate the model to point it into the wind, or use the yaw angle for a crosswind. Z is up.";
@@ -891,6 +926,7 @@ function cleanSetup(s) {
   oneOf("domainScale", optionValues("domainScale"));
   oneOf("walls", ["exact", "cubes"]);
   oneOf("portMode", ["simple", "ports"]);
+  oneOf("gasModel", ["lbm", "gas"]);
   oneOf("flowUnit", Object.keys(FLOW_UNITS));
   if ("ports" in s) {
     if (!Array.isArray(s.ports) || s.ports.length > 8) bad("ports");
@@ -982,6 +1018,7 @@ function wire() {
   $("cadQuality").addEventListener("change", () => { if (lastFile) loadFile({ name: lastFile.name }, lastFile.buffer); });
   sel("domainScale", "domainScale");
   sel("walls", "walls", String);
+  $("gasModel").addEventListener("change", (e) => { state.gasModel = e.target.value; syncInputs(true); invalidate(); });
   $("portMode").addEventListener("change", (e) => {
     state.portMode = e.target.value; syncInputs(true); invalidate();
     if (state.portMode === "ports" && !openings.length) findOpenings();
@@ -1132,7 +1169,7 @@ function wire() {
 async function start() {
   wire();
   try {
-    solver = await Solver.create();
+    lbm = solver = await Solver.create();
     $("gpuChip").textContent = "GPU solver ready";
     $("gpuChip").classList.add("ok");
   } catch (e) {

@@ -104,6 +104,13 @@
               <option value="ports">Custom: set each opening (air jets, several inlets)</option>
             </select>
           </div>
+          <div class="field" id="gasRow" hidden>
+            <label for="gasModel">Air model</label>
+            <select id="gasModel">
+              <option value="lbm">Incompressible (fast, for speeds under about 100 m/s)</option>
+              <option value="gas">Compressible gas (for jets fed at pressure)</option>
+            </select>
+          </div>
           <div id="portsBox" hidden>
             <button type="button" class="btn" id="findPorts">Find openings</button>
             <ul class="conds" id="portList"></ul>

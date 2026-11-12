@@ -46,6 +46,10 @@ Both were checked against OpenFOAM v1912 (the Ubuntu package). In that particula
 
 By default the exported case is steady and incompressible. Tick "Treat air as compressible" for parts fed with compressed air: fed openings set by supply pressure become reservoirs at that pressure, air is a perfect gas, and the case is solved with rhoPimpleFoam in local time stepping mode, with the supply pressure brought up gradually so the solver stays stable. Checked on the air mover demo at 2 bar gauge: the nozzle chokes and passes 19.7 g/s against 20.1 g/s from nozzle theory (25,000 cells), and the page shows mass flow per opening and the amplification by mass.
 
+### Compressible gas in the browser
+
+With Openings set to Custom, the Air model selector offers "Compressible gas". That runs a finite-volume solver for the full gas equations on the GPU (src/compressible.js), so a fed opening set by supply pressure is a real reservoir: the nozzle chokes, the jet goes supersonic and the page reports mass flow per opening and the peak Mach number. Checked against a shock tube, nozzle theory and a Mach 2 shock (docs/COMPRESSIBLE.md). Known limits: cube walls only, many more steps than the incompressible solver, and the amount of air a jet drags along is not yet reliable at coarse grids (aim for 8 or more cells across the nozzle and treat the figure as rough even then).
+
 ## Run it
 
 ```

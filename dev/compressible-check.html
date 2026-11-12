@@ -78,20 +78,28 @@ window.sod = async (axis, N, opts = {}) => {
   });
   const s = await getSolver();
   await s.setup(grid, { ...AIR, mu: 0, smagorinsky: 0, ...(opts.gas || {}) }, []);
-  s.setState(ambientState(grid, (i, j, k) => (along(i, j, k) <= N / 2 ? null : [0.125 * RHO, 0, 0, 0, 0.1 * P0])));
-  const T = 0.2 / UREF; // 0.2 in the usual units of the problem (tube length 1, left state density 1, pressure 1)
+  // states as [density, speed along the tube, pressure] in units of ambient density, sqrt(p / density) and ambient pressure
+  const SL = opts.left || [1, 0, 1], SR = opts.right || [0.125, 0, 0.1];
+  const cellState = (S) => { const v = [S[0] * RHO, 0, 0, 0, S[2] * P0]; v[1 + axis] = S[1] * UREF; return v; };
+  s.setState(ambientState(grid, (i, j, k) => cellState(along(i, j, k) <= N / 2 ? SL : SR)));
+  const T = (opts.t || 0.2) / UREF; // 0.2 in the usual units of the problem (tube length 1, left state density 1, pressure 1)
   while (s.time < T && !s.diverged) {
     const left = s.dt ? Math.floor((T - s.time) / (s.dt * s.tRef)) : 1;
     await s.step(Math.max(1, Math.min(left, 200)));
   }
   const out = await s.read(), f = out.fields;
-  const exact = exactRiemann({ r: RHO, u: 0, p: P0 }, { r: 0.125 * RHO, u: 0, p: 0.1 * P0 }, 1.4);
+  const exact = exactRiemann({ r: SL[0] * RHO, u: SL[1] * UREF, p: SL[2] * P0 }, { r: SR[0] * RHO, u: SR[1] * UREF, p: SR[2] * P0 }, 1.4);
+  let rMin = Infinity, pMin = Infinity, used = 0;
   let e = [0, 0, 0], cross = 0, trans = 0;
   const profile = [];
   for (let m = 1; m <= N; m++) {
     const p = [1, 1, 1]; p[axis] = m;
     const c = p[0] + grid.nx * (p[1] + grid.ny * p[2]);
     const x = (m - 0.5 - N / 2) * dx, ex = exact(x / out.time);
+    rMin = Math.min(rMin, f[8 * c] / RHO); pMin = Math.min(pMin, f[8 * c + 4] / P0);
+    // with moving gas the closed ends of the duct send waves back in; opts.window leaves those regions out
+    if (Math.abs(x) > (opts.window || 1)) continue;
+    used++;
     e[0] += Math.abs(f[8 * c] - ex.r) / RHO;
     e[1] += Math.abs(f[8 * c + 1 + axis] - ex.u) / UREF;
     e[2] += Math.abs(f[8 * c + 4] - ex.p) / P0;
@@ -105,7 +113,7 @@ window.sod = async (axis, N, opts = {}) => {
     for (let d = 0; d < 3; d++) if (d !== axis) trans = Math.max(trans, Math.abs(f[8 * c + 1 + d]) / UREF);
     if (opts.profile) profile.push([r4(x), r4(f[8 * c] / RHO), r4(f[8 * c + 1 + axis] / UREF), r4(f[8 * c + 4] / P0), r4(ex.r / RHO), r4(ex.u / UREF), r4(ex.p / P0)]);
   }
-  return { axis, N, steps: s.steps, time: out.time * UREF, L1: e.map((v) => +(v / N).toExponential(3)), crossDiff: cross, transverse: trans, fallbacks: out.firstOrderFallbacks, clamps: out.clamps, profile };
+  return { axis, N, steps: s.steps, time: out.time * UREF, L1: e.map((v) => +(v / used).toExponential(3)), crossDiff: cross, transverse: trans, minDensity: r4(rMin), minPressure: r4(pMin), bad: out.bad, diverged: s.diverged, fallbacks: out.firstOrderFallbacks, clamps: out.clamps, profile };
 };
 
 // 2. Closed box with a solid block inside and a lumpy, swirling start: mass and energy must not drift.
@@ -164,7 +172,7 @@ function nozzleGrid(o) {
   return { grid, throatCells: throat, inletCells: inlet, x1, cy, cz };
 }
 window.nozzleRun = async (gaugeBar, opts = {}) => {
-  const o = { Rin: 8, Rt: 4, Lp: 6, Ln: 12, Lc: 24, W: 24, dx: 0.0005, maxSteps: 4000, every: 200, tol: 0.002, ...opts };
+  const o = { Rin: 7, Rt: 4, Lp: 4, Ln: 10, Lc: 16, W: 18, dx: 0.0005, maxSteps: 4000, every: 200, tol: 0.002, ...opts };
   const { grid, throatCells, inletCells, x1 } = nozzleGrid(o);
   const s = await getSolver();
   const p0 = P0 + gaugeBar * 1e5;
@@ -292,6 +300,67 @@ window.wedge = async (opts = {}) => {
   };
 };
 
+// Oblique shock relations for a stream at Mach M turned through th radians (weak solution).
+function obliqueShock(M, th) {
+  const g = 1.4;
+  let beta = Math.asin(1 / M) + 1e-4;
+  for (let it = 0; it < 200; it++) {
+    const fn = (b) => Math.tan(th) - 2 / Math.tan(b) * (M * M * Math.sin(b) ** 2 - 1) / (M * M * (g + Math.cos(2 * b)) + 2);
+    const h = 1e-6; beta -= fn(beta) / ((fn(beta + h) - fn(beta - h)) / (2 * h));
+  }
+  const mn = M * Math.sin(beta), pr = 1 + 2 * g / (g + 1) * (mn * mn - 1);
+  const mn2 = Math.sqrt((1 + 0.2 * mn * mn) / (g * mn * mn - 0.2));
+  return { beta, pr, M2: mn2 / Math.sin(beta - th) };
+}
+
+// 5a. The same oblique shock with a wall that lies along the grid: a Mach 2 stream arrives
+// tilted 15 degrees towards a flat plate. No staircase is involved, so this checks the solver itself.
+window.plate = async (opts = {}) => {
+  const o = { nx: 120, ny: 52, x0: 15, angle: 15, mach: 2, passes: 3, ...opts };
+  const { nx, ny } = o, nz = 5, th = o.angle * Math.PI / 180;
+  const grid = makeGrid(nx, ny, nz, 0.001, (i, j, k) => {
+    if (k === 0 || k === nz - 1) return 1;
+    if (j === 0) return i >= o.x0 ? 1 : 2;
+    if (i === 0 || j === ny - 1) return 2;
+    if (i === nx - 1) return 4 | (1 << 3);
+    return 0;
+  });
+  const U = o.mach * CAMB, s = await getSolver();
+  await s.setup(grid, { ...AIR, mu: 0, smagorinsky: 0, farfield: { pressure: P0, temperature: 293.15, velocity: [U * Math.cos(th), -U * Math.sin(th), 0] } }, []);
+  const Tend = o.passes * nx * grid.dx / U, rows = [];
+  while (s.time < Tend && !s.diverged) {
+    await s.step(200);
+    const t = await s.totals();
+    rows.push([s.steps, r4(s.time / Tend * o.passes), r4(t.maxMach), r4(t.minPressure / P0), t.firstOrderFallbacks, t.clamps]);
+  }
+  const r = await s.read(), f = r.fields, k = 2, sh = obliqueShock(o.mach, th);
+  const half = 1 + 0.5 * (sh.pr - 1), pts = [], P = (i, j) => f[8 * (i + nx * (j + ny * k)) + 4] / P0;
+  for (let i = o.x0 + 20; i <= o.x0 + 70 && i < nx - 2; i++) {
+    for (let j = ny - 3; j > 1; j--) {
+      const a = P(i, j), b = P(i, j - 1);
+      if (a < half && b >= half) { pts.push([i + 0.5 - o.x0, j - 0.5 - (half - a) / (b - a)]); break; } // height above the plate, in cells
+    }
+  }
+  let sx = 0, sy = 0, sxy = 0, sxx = 0;
+  for (const [x, y] of pts) { sx += x; sy += y; sxy += x * y; sxx += x * x; }
+  const nP = pts.length, slope = (nP * sxy - sx * sy) / (nP * sxx - sx * sx), icpt = (sy - slope * sx) / nP;
+  let pS = 0, mS = 0, cnt = 0, pMin = 1e9, pMax = 0, thick = 0;
+  for (let i = o.x0 + 40; i <= o.x0 + 70; i++) {
+    const ysh = icpt + slope * (i + 0.5 - o.x0);
+    for (let j = 1; j < ny - 1; j++) {
+      const y = j - 0.5, p = P(i, j);
+      if (y < ysh - 4) { pS += p; mS += f[8 * (i + nx * (j + ny * k)) + 6]; cnt++; pMin = Math.min(pMin, p); pMax = Math.max(pMax, p); }
+      if (p > 1 + 0.1 * (sh.pr - 1) && p < 1 + 0.9 * (sh.pr - 1)) thick++;
+    }
+  }
+  return {
+    cells: grid.n, fluid: fluidCount(grid), steps: s.steps, passes: r4(s.time * U / (nx * grid.dx)), bad: r.bad, fallbacks: r.firstOrderFallbacks, clamps: r.clamps,
+    theory: { shockAngleToPlate: r4((sh.beta - th) * 180 / Math.PI), pressureRatio: r4(sh.pr), mach2: r4(sh.M2) },
+    measured: { shockAngleToPlate: r4(Math.atan(slope) * 180 / Math.PI), heightAtLeadingEdge: r4(icpt), points: nP, pressureRatio: r4(pS / cnt), pressureRange: [r4(pMin), r4(pMax)], mach2: r4(mS / cnt), samples: cnt, shockCellsPerColumn: r4(thick / 31) },
+    rows,
+  };
+};
+
 // 6. The app's own air mover demo with the nozzle fed from a reservoir.
 window.jetpump = async (res, gaugeBar, maxSteps, every, opts = {}) => {
   const d = DEMOS.jetpump;
@@ -303,12 +372,21 @@ window.jetpump = async (res, gaugeBar, maxSteps, every, opts = {}) => {
   const ports = grid.ports.map((p) => (p.type === "feed" ? { type: "feed", totalPressure: P0 + gaugeBar * 1e5, totalTemperature: 293.15 } : { type: "open", pressure: P0, temperature: 293.15 }));
   await s.setup(grid, { ...AIR, ...(opts.gas || {}) }, ports);
   const area = grid.ports[0].area, ideal = nozzle(gaugeBar * 1e5, area);
-  const hist = [], wall0 = performance.now();
+  const hist = [], wall0 = performance.now(), sub = opts.sub || 40;
   let t;
   while (s.steps < maxSteps && !s.diverged) {
-    await s.step(every);
-    t = await s.totals();
-    const row = [s.steps, r4(t.time * 1e3), ...t.ports.map((p) => +(p.massFlow * 1e3).toFixed(4)), r4(t.ports[1].massFlow / t.ports[0].massFlow), r4(t.maxMach), t.firstOrderFallbacks, t.clamps];
+    // port flows averaged over this window (sampled every few steps), so that pressure waves
+    // sloshing along the tube do not make a single reading misleading
+    const mean = grid.ports.map(() => 0), lo = grid.ports.map(() => Infinity), hi = grid.ports.map(() => -Infinity);
+    let cnt = 0;
+    for (let q = 0; q < every && !s.diverged; q += sub) {
+      await s.step(sub);
+      t = await s.totals();
+      t.ports.forEach((p, i) => { mean[i] += p.massFlow; lo[i] = Math.min(lo[i], p.massFlow); hi[i] = Math.max(hi[i], p.massFlow); });
+      cnt++;
+    }
+    const m = mean.map((v) => v / cnt);
+    const row = [s.steps, r4(t.time * 1e3), ...m.map((v) => +(v * 1e3).toFixed(3)), r4(m[1] / m[0]), +(lo[1] * 1e3).toFixed(2), +(hi[1] * 1e3).toFixed(2), r4(t.maxMach), t.firstOrderFallbacks, t.clamps];
     hist.push(row);
     console.log("jetpump " + JSON.stringify(row));
   }

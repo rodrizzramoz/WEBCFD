@@ -3,7 +3,7 @@
 //
 // Method in short: cell-centred finite volume on the uniform grid from buildDomain,
 // conserved variables (density, momentum, total energy), second-order MUSCL reconstruction
-// of the primitive variables with the van Leer limiter, HLLC flux, laminar plus Smagorinsky
+// of the primitive variables with the monotonised central limiter, HLLC flux, laminar plus Smagorinsky
 // viscosity and heat conduction, two-stage strong-stability-preserving Runge-Kutta in time.
 //
 // Units inside the shader are non-dimensional: pressure in units of the ambient pressure,
@@ -15,45 +15,24 @@ const K = 44;        // diagnostic channels per row: 12 general ones, then 4 for
 const KBASE = 12;
 const CELL = 6;      // floats stored per cell: density, momentum x y z, total energy, eddy viscosity
 
-const COMMON = /* wgsl */ `
+// Shared by every shader: the parameter block and the gas dynamics that need no grid access.
+const PHYSICS = /* wgsl */ `
 struct Params {
-  dims: vec4u,             // nx, ny, nz, mode (diagnostics only: 0 = time step data, 1 = everything)
+  dims: vec4u,             // nx, ny, nz, then: number of port cells (step and ghost passes) or mode (diagnostics)
   a: vec4f,                // time step, Runge-Kutta weight of the old state, weight of the new state, gamma
   b: vec4f,                // laminar viscosity, (Smagorinsky constant x cell size) squared, 1 / Prandtl, 1 / turbulent Prandtl
   ff: vec4f,               // far field (and starting) state: density, pressure
   ffU: vec4f,              // far field velocity
-  ports: array<vec4f, 8>,  // kind (0 = fed from a reservoir, 1 = open), pressure, temperature
+  ports: array<vec4f, 8>,  // kind (0 = fed from a reservoir, 1 = open), pressure, temperature, relaxation of an opening
 };
 @group(0) @binding(0) var<uniform> P: Params;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read> flags: array<u32>;
 
 struct Prim { r: f32, u: vec3f, p: f32 };
 struct Flux { m: f32, mom: vec3f, e: f32 };
-struct Cell { w: Prim, f: u32, mt: f32 };
 
 const AX = array<vec3i, 3>(vec3i(1, 0, 0), vec3i(0, 1, 0), vec3i(0, 0, 1));
 const NRM = array<vec3i, 6>(vec3i(1, 0, 0), vec3i(-1, 0, 0), vec3i(0, 1, 0), vec3i(0, -1, 0), vec3i(0, 0, 1), vec3i(0, 0, -1));
 
-fn cidx(p: vec3i) -> u32 { return u32(p.x) + P.dims.x * (u32(p.y) + P.dims.y * u32(p.z)); }
-// Flag of a cell; anything outside the grid counts as a solid wall.
-fn flagAt(p: vec3i) -> u32 {
-  if (any(p < vec3i(0)) || any(p >= vec3i(P.dims.xyz))) { return 1u; }
-  return flags[cidx(p)];
-}
-fn loadPrim(c: u32) -> Prim {
-  let o = c * 6u;
-  let r = src[o];
-  let u = vec3f(src[o + 1u], src[o + 2u], src[o + 3u]) / r;
-  return Prim(r, u, (P.a.w - 1.0) * (src[o + 4u] - 0.5 * r * dot(u, u)));
-}
-// Only fluid cells are ever read; walls and boundary cells are replaced by ghost states.
-fn loadCell(p: vec3i) -> Cell {
-  let f = flagAt(p);
-  if ((f & 7u) != 0u) { return Cell(Prim(1.0, vec3f(0.0), 1.0), f, 0.0); }
-  let c = cidx(p);
-  return Cell(loadPrim(c), f, src[c * 6u + 5u]);
-}
 fn mirror(W: Prim, e: vec3f) -> Prim { return Prim(W.r, W.u - 2.0 * dot(W.u, e) * e, W.p); }
 
 // Inflow from a reservoir at total pressure p0 and total temperature T0 through a face
@@ -79,24 +58,22 @@ fn reservoir(W: Prim, n: vec3f, p0: f32, T0: f32) -> Prim {
 }
 
 // Opening to surroundings at static pressure pb and temperature Tb.
-fn openGhost(W: Prim, n: vec3f, pb: f32, Tb: f32) -> Prim {
+// For air leaving slower than sound the outside pressure is not forced on the face at once:
+// the face pressure is pulled towards pb by the fraction relax each time. In steady flow the
+// pressure at the opening still ends up exactly pb, but pressure waves pass out instead of
+// bouncing back, so a duct with open ends does not ring like an organ pipe. relax = 1 gives
+// the plain fixed-pressure opening.
+fn openGhost(W: Prim, n: vec3f, pb: f32, Tb: f32, relax: f32) -> Prim {
   let g = P.a.w;
   let un = dot(W.u, n);
   if (un > 0.0) { return reservoir(W, n, pb, Tb); }   // drawing air in from still surroundings
   let ci = sqrt(g * W.p / W.r);
   if (-un >= ci) { return W; }                        // leaving faster than sound: nothing travels back in
-  let rg = W.r * pow(pb / W.p, 1.0 / g);              // leaving slower than sound: the outside pressure is felt
-  let cg = sqrt(g * pb / rg);
+  let pg = W.p + relax * (pb - W.p);                  // leaving slower than sound: the outside pressure is felt
+  let rg = W.r * pow(pg / W.p, 1.0 / g);
+  let cg = sqrt(g * pg / rg);
   let q = -un + 2.0 * (ci - cg) / (g - 1.0);
-  return Prim(rg, W.u - n * (un + q), pb);
-}
-
-// State just outside a boundary cell, as seen from the fluid cell W next to it. n points into the domain.
-fn ghost(W: Prim, flag: u32, n: vec3f) -> Prim {
-  if ((flag & 7u) == 2u) { return Prim(P.ff.x, P.ffU.xyz, P.ff.y); }
-  let port = P.ports[(flag >> 6u) & 7u];
-  if (port.x < 0.5) { return reservoir(W, n, port.y, port.z); }
-  return openGhost(W, n, port.y, port.z);
+  return Prim(rg, W.u - n * (un + q), pg);
 }
 
 // HLLC approximate Riemann solver. Returns the flux in direction e.
@@ -109,16 +86,9 @@ fn hllc(L: Prim, R: Prim, e: vec3f) -> Flux {
   let cR = sqrt(g * R.p / R.r);
   let EL = L.p * gi + 0.5 * L.r * dot(L.u, L.u);
   let ER = R.p * gi + 0.5 * R.r * dot(R.u, R.u);
-  // wave speed bounds from the Roe average (Einfeldt, Batten)
-  let sl = sqrt(L.r);
-  let sr = sqrt(R.r);
-  let wi = 1.0 / (sl + sr);
-  let uh = (sl * L.u + sr * R.u) * wi;
-  let Hh = (sl * (EL + L.p) / L.r + sr * (ER + R.p) / R.r) * wi;
-  let qh = dot(uh, e);
-  let ch = sqrt(max((g - 1.0) * (Hh - 0.5 * dot(uh, uh)), 1e-12));
-  let SL = min(qL - cL, qh - ch);
-  let SR = max(qR + cR, qh + ch);
+  // bounds on the fastest waves to the left and right (Davis)
+  let SL = min(qL - cL, qR - cR);
+  let SR = max(qL + cL, qR + cR);
   let FL = Flux(L.r * qL, L.r * qL * L.u + L.p * e, qL * (EL + L.p));
   if (SL >= 0.0) { return FL; }
   let FR = Flux(R.r * qR, R.r * qR * R.u + R.p * e, qR * (ER + R.p));
@@ -137,18 +107,65 @@ fn hllc(L: Prim, R: Prim, e: vec3f) -> Flux {
   let E = k * (ER / R.r + (SM - qR) * (SM + R.p / dR));
   return Flux(FR.m + SR * (k - R.r), FR.mom + SR * (m - R.r * R.u), FR.e + SR * (E - ER));
 }
+`;
 
-// Pressure on a solid wall from the exact solution of the mirror Riemann problem.
-// q is the speed of the gas towards the wall.
-fn wallPressure(W: Prim, q: f32) -> f32 {
-  let g = P.a.w;
-  let c = sqrt(g * W.p / W.r);
-  let M = q / c;
-  if (M >= 0.0) {
-    let h = 0.25 * (g + 1.0) * M;
-    return W.p * (1.0 + g * M * (h + sqrt(1.0 + h * h)));
-  }
-  return W.p * pow(max(1.0 + 0.5 * (g - 1.0) * M, 0.0), 2.0 * g / (g - 1.0));
+// Grid access for the step and diagnostics shaders.
+const COMMON = PHYSICS + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read> flags: array<u32>;
+
+// bad marks a cell whose density or pressure fell steeply in the last stage ("troubled").
+struct Cell { w: Prim, f: u32, mt: f32, bad: bool };
+
+fn cidx(p: vec3i) -> u32 { return u32(p.x) + P.dims.x * (u32(p.y) + P.dims.y * u32(p.z)); }
+// Flag of a cell; anything outside the grid counts as a solid wall.
+fn flagAt(p: vec3i) -> u32 {
+  if (any(p < vec3i(0)) || any(p >= vec3i(P.dims.xyz))) { return 1u; }
+  return flags[cidx(p)];
+}
+fn loadPrim(c: u32) -> Prim {
+  let o = c * 6u;
+  let r = src[o];
+  let u = vec3f(src[o + 1u], src[o + 2u], src[o + 3u]) / r;
+  return Prim(r, u, (P.a.w - 1.0) * (src[o + 4u] - 0.5 * r * dot(u, u)));
+}
+// Solid cells are never read. Port and far field cells hold the state just outside the boundary.
+fn loadCell(p: vec3i) -> Cell {
+  let f = flagAt(p);
+  if ((f & 7u) == 1u) { return Cell(Prim(1.0, vec3f(0.0), 1.0), f, 0.0, false); }
+  let c = cidx(p);
+  let v = src[c * 6u + 5u];
+  // the sixth value is the eddy viscosity; a troubled cell stores it as -1 - viscosity
+  if (v < -0.5) { return Cell(loadPrim(c), f, -1.0 - v, true); }
+  return Cell(loadPrim(c), f, v, false);
+}
+`;
+
+// Fills the port cells with the state just outside each port, worked out from the fluid cell inside.
+const GHOST_WGSL = PHYSICS + /* wgsl */ `
+@group(0) @binding(1) var<storage, read_write> st: array<f32>;
+@group(0) @binding(2) var<storage, read> list: array<u32>; // per port cell: its index, the fluid cell inside, its flag
+
+@compute @workgroup_size(64)
+fn ghosts(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= P.dims.w) { return; }
+  let cell = list[3u * id.x];
+  let flag = list[3u * id.x + 2u];
+  let j = list[3u * id.x + 1u] * 6u;
+  let r = st[j];
+  let u = vec3f(st[j + 1u], st[j + 2u], st[j + 3u]) / r;
+  let W = Prim(r, u, (P.a.w - 1.0) * (st[j + 4u] - 0.5 * r * dot(u, u)));
+  let n = vec3f(NRM[(flag >> 3u) & 7u]);
+  let port = P.ports[(flag >> 6u) & 7u];
+  var G = W;
+  if (port.x < 0.5) { G = reservoir(W, n, port.y, port.z); } else { G = openGhost(W, n, port.y, port.z, port.w); }
+  let o = cell * 6u;
+  st[o] = G.r;
+  st[o + 1u] = G.r * G.u.x;
+  st[o + 2u] = G.r * G.u.y;
+  st[o + 3u] = G.r * G.u.z;
+  st[o + 4u] = G.p / (P.a.w - 1.0) + 0.5 * G.r * dot(G.u, G.u);
+  st[o + 5u] = 0.0;
 }
 `;
 
@@ -158,113 +175,70 @@ const STAGE_WGSL = COMMON + /* wgsl */ `
 
 const RFLOOR = 1e-3;
 const PFLOOR = 1e-3;
+const DROP = 0.3;   // a cell losing more than 70 percent of its density or pressure in one stage is troubled
 
-// van Leer limiter: the limited difference from two neighbouring differences
-fn vl(a: f32, b: f32) -> f32 {
-  let ab = a * b;
-  if (ab <= 0.0) { return 0.0; }
-  return 2.0 * ab / (a + b);
+// Monotonised central limiter, written without branches or divisions: the limited
+// difference is the central one, held to at most twice either one-sided difference,
+// and zero at a peak or trough.
+fn lim3(a: vec3f, b: vec3f) -> vec3f {
+  let s = sign(a);
+  return s * max(vec3f(0.0), min(min(2.0 * abs(a), 2.0 * s * b), 0.5 * s * (a + b)));
+}
+fn lim2(a: vec2f, b: vec2f) -> vec2f {
+  let s = sign(a);
+  return s * max(vec2f(0.0), min(min(2.0 * abs(a), 2.0 * s * b), 0.5 * s * (a + b)));
 }
 // State at a cell face: cell value plus s (plus or minus a half) times the limited difference.
 fn recon(Wm: Prim, W0: Prim, Wp: Prim, s: f32) -> Prim {
-  let a = W0.u - Wm.u;
-  let b = Wp.u - W0.u;
-  return Prim(
-    W0.r + s * vl(W0.r - Wm.r, Wp.r - W0.r),
-    W0.u + s * vec3f(vl(a.x, b.x), vl(a.y, b.y), vl(a.z, b.z)),
-    W0.p + s * vl(W0.p - Wm.p, Wp.p - W0.p));
+  let rp = lim2(vec2f(W0.r - Wm.r, W0.p - Wm.p), vec2f(Wp.r - W0.r, Wp.p - W0.p));
+  return Prim(W0.r + s * rp.x, W0.u + s * lim3(W0.u - Wm.u, Wp.u - W0.u), W0.p + s * rp.y);
 }
-// The cell beyond X, as X sees it when working out its own slope: a wall mirrors X,
-// a boundary cell gives no slope.
+// The cell beyond X, as X sees it when working out its own slope: a wall mirrors X.
 fn beyond(far: Cell, X: Prim, e: vec3f) -> Prim {
-  let t = far.f & 7u;
-  if (t == 0u) { return far.w; }
-  if (t == 1u) { return mirror(X, e); }
-  return X;
+  if ((far.f & 7u) == 1u) { return mirror(X, e); }
+  return far.w;
 }
 
 // Flux in direction e through the face between cells L and R, which lie in a row LL, L, R, RR.
 // Every face is worked out twice (once from each side) with identical inputs, so what one
 // cell loses the other gains exactly.
-fn faceFlux(LL: Cell, L: Cell, R: Cell, RR: Cell, e: vec3f, first: bool) -> Flux {
+fn faceFlux(LL: Cell, L: Cell, R: Cell, RR: Cell, e: vec3f) -> Flux {
   let tL = L.f & 7u;
   let tR = R.f & 7u;
+  let wallL = tL == 1u;
+  let wallR = tR == 1u;
   let g = P.a.w;
-  if (tL == 0u && tR == 0u) {
-    var WL = L.w;
-    var WR = R.w;
-    if (!first) {
-      WL = recon(beyond(LL, L.w, e), L.w, R.w, 0.5);
-      WR = recon(L.w, R.w, beyond(RR, R.w, e), -0.5);
-    }
-    var F = hllc(WL, WR, e);
-    // viscous stress and heat conduction from the difference across the face
-    let mt = 0.5 * (L.mt + R.mt);
-    let mu = P.b.x + mt;
-    let kc = (P.b.x * P.b.z + mt * P.b.w) * g / (g - 1.0);
-    F.mom -= mu * (R.w.u - L.w.u);
-    F.e -= 0.5 * mu * (dot(R.w.u, R.w.u) - dot(L.w.u, L.w.u)) + kc * (R.w.p / R.w.r - L.w.p / L.w.r);
-    return F;
+  // first order on boundary faces and next to a troubled cell (the positivity fallback)
+  let first = L.bad || R.bad || tL >= 2u || tR >= 2u;
+  var A = L.w;
+  var B = R.w;
+  if (wallR) { B = mirror(A, e); }
+  if (wallL) { A = mirror(B, e); }
+  var WL = A;
+  var WR = B;
+  if (!first) {
+    if (!wallL) { WL = recon(beyond(LL, A, e), A, B, 0.5); }
+    if (!wallR) { WR = recon(A, B, beyond(RR, B, e), -0.5); }
+    if (wallR) { WR = mirror(WL, e); }
+    if (wallL) { WL = mirror(WR, e); }
   }
-  if (tL == 0u) {
-    if (tR == 1u) {
-      // wall on the far side of L: pressure only, plus no-slip friction, no heat flow
-      var W = L.w;
-      if (!first) { W = recon(beyond(LL, L.w, e), L.w, mirror(L.w, e), 0.5); }
-      return Flux(0.0, wallPressure(W, dot(W.u, e)) * e + 2.0 * (P.b.x + L.mt) * L.w.u, 0.0);
-    }
-    return hllc(L.w, ghost(L.w, R.f, -e), e);
+  var F = hllc(WL, WR, e);
+  if (wallR) {
+    // Solid wall: pressure only (never suction), no heat flow, and the laminar no-slip
+    // stress over the half cell to the wall. The eddy viscosity is left out here on purpose:
+    // without a wall model it would overstate wall friction many times over.
+    return Flux(0.0, max(dot(F.mom, e), 0.0) * e + 2.0 * P.b.x * L.w.u, 0.0);
   }
-  if (tL == 1u) {
-    var W = R.w;
-    if (!first) { W = recon(mirror(R.w, e), R.w, beyond(RR, R.w, e), -0.5); }
-    return Flux(0.0, wallPressure(W, -dot(W.u, e)) * e - 2.0 * (P.b.x + R.mt) * R.w.u, 0.0);
+  if (wallL) {
+    return Flux(0.0, max(dot(F.mom, e), 0.0) * e - 2.0 * P.b.x * R.w.u, 0.0);
   }
-  return hllc(ghost(R.w, L.f, e), R.w, e);
-}
-
-struct Rhs { m: f32, mom: vec3f, e: f32, mt: f32 };
-
-// Net inflow of mass, momentum and energy into a fluid cell, and its eddy viscosity.
-fn rhs(pos: vec3i, first: bool) -> Rhs {
-  let C0 = loadCell(pos);
-  var out = Rhs(0.0, vec3f(0.0), 0.0, 0.0);
-  var G: array<vec3f, 3>;
-  for (var a = 0; a < 3; a++) {
-    let d = AX[a];
-    let e = vec3f(d);
-    let m1 = loadCell(pos - d);
-    let p1 = loadCell(pos + d);
-    var m2 = C0;
-    var p2 = C0;
-    if ((m1.f & 7u) == 0u) { m2 = loadCell(pos - 2 * d); }
-    if ((p1.f & 7u) == 0u) { p2 = loadCell(pos + 2 * d); }
-    let Fm = faceFlux(m2, m1, C0, p1, e, first);
-    let Fp = faceFlux(m1, C0, p1, p2, e, first);
-    out.m += Fm.m - Fp.m;
-    out.mom += Fm.mom - Fp.mom;
-    out.e += Fm.e - Fp.e;
-    // velocity gradient for the eddy viscosity: zero velocity on walls, no slope at boundaries
-    var um = m1.w.u;
-    var up = p1.w.u;
-    let tm = m1.f & 7u;
-    let tp = p1.f & 7u;
-    if (tm == 1u) { um = -C0.w.u; } else if (tm != 0u) { um = C0.w.u; }
-    if (tp == 1u) { up = -C0.w.u; } else if (tp != 0u) { up = C0.w.u; }
-    G[a] = 0.5 * (up - um);
-  }
-  // Smagorinsky: eddy viscosity = density x (Cs x cell size)^2 x strain rate, using the
-  // shearing part of the strain only so that shocks and plain compression do not add to it.
-  let tr = (G[0].x + G[1].y + G[2].z) / 3.0;
-  let dxx = G[0].x - tr;
-  let dyy = G[1].y - tr;
-  let dzz = G[2].z - tr;
-  let sxy = G[1].x + G[0].y;
-  let sxz = G[2].x + G[0].z;
-  let syz = G[2].y + G[1].z;
-  let ss = dxx * dxx + dyy * dyy + dzz * dzz + 0.5 * (sxy * sxy + sxz * sxz + syz * syz);
-  out.mt = C0.w.r * P.b.y * sqrt(2.0 * ss);
-  return out;
+  // viscous stress and heat conduction from the difference across the face
+  let mt = 0.5 * (L.mt + R.mt);
+  let mu = P.b.x + mt;
+  let kc = (P.b.x * P.b.z + mt * P.b.w) * g / (g - 1.0);
+  F.mom -= mu * (B.u - A.u);
+  F.e -= 0.5 * mu * (dot(B.u, B.u) - dot(A.u, A.u)) + kc * (B.p / B.r - A.p / A.r);
+  return F;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -283,52 +257,72 @@ fn init(@builtin(global_invocation_id) id: vec3u) {
 }
 
 // One Runge-Kutta stage: dst = wOld x dst + wNew x (src + dt x rhs(src)).
+// Only fluid cells change: walls and far field cells keep their starting values,
+// port cells are filled by the ghost pass.
 @compute @workgroup_size(4, 4, 4)
 fn stage(@builtin(global_invocation_id) id: vec3u) {
   if (any(id >= P.dims.xyz)) { return; }
   let pos = vec3i(id);
   let i = cidx(pos);
-  let flag = flags[i];
-  let t = flag & 7u;
+  if ((flags[i] & 7u) != 0u) { return; }
   let o = i * 6u;
-  if (t == 1u || t == 2u) { return; }
-  if (t >= 3u) {
-    // Port cells take no part in the sums. They carry a copy of the cell inside for drawing.
-    let q = pos + NRM[(flag >> 3u) & 7u];
-    if ((flagAt(q) & 7u) == 0u) {
-      let j = cidx(q) * 6u;
-      for (var c = 0u; c < 6u; c++) { dst[o + c] = src[j + c]; }
-    }
-    return;
+  let C0 = loadCell(pos);
+  // net inflow of mass, momentum and energy, and the velocity gradient for the eddy viscosity
+  var km = 0.0;
+  var kmom = vec3f(0.0);
+  var ke = 0.0;
+  var G: array<vec3f, 3>;
+  for (var a = 0; a < 3; a++) {
+    let d = AX[a];
+    let e = vec3f(d);
+    let m1 = loadCell(pos - d);
+    let p1 = loadCell(pos + d);
+    let m2 = loadCell(pos - 2 * d);
+    let p2 = loadCell(pos + 2 * d);
+    let Fm = faceFlux(m2, m1, C0, p1, e);
+    let Fp = faceFlux(m1, C0, p1, p2, e);
+    km += Fm.m - Fp.m;
+    kmom += Fm.mom - Fp.mom;
+    ke += Fm.e - Fp.e;
+    var um = m1.w.u;
+    var up = p1.w.u;
+    if ((m1.f & 7u) == 1u) { um = C0.w.u; }   // one-sided next to a wall, so walls do not switch the eddy viscosity on
+    if ((p1.f & 7u) == 1u) { up = C0.w.u; }
+    G[a] = 0.5 * (up - um);
   }
+  // Smagorinsky: eddy viscosity = density x (Cs x cell size)^2 x strain rate, using the
+  // shearing part of the strain only so that shocks and plain compression do not add to it.
+  let tr = (G[0].x + G[1].y + G[2].z) / 3.0;
+  let dxx = G[0].x - tr;
+  let dyy = G[1].y - tr;
+  let dzz = G[2].z - tr;
+  let sxy = G[1].x + G[0].y;
+  let sxz = G[2].x + G[0].z;
+  let syz = G[2].y + G[1].z;
+  let ss = dxx * dxx + dyy * dyy + dzz * dzz + 0.5 * (sxy * sxy + sxz * sxz + syz * syz);
+  var mt = C0.w.r * P.b.y * sqrt(2.0 * ss);
+
   let dt = P.a.x;
   let gm = P.a.w - 1.0;
   let r0 = src[o];
   let m0 = vec3f(src[o + 1u], src[o + 2u], src[o + 3u]);
   let e0 = src[o + 4u];
-  var k = rhs(pos, false);
-  var r = r0 + dt * k.m;
-  var m = m0 + dt * k.mom;
-  var E = e0 + dt * k.e;
+  var r = r0 + dt * km;
+  var m = m0 + dt * kmom;
+  var E = e0 + dt * ke;
   var p = gm * (E - 0.5 * dot(m, m) / r);
-  if (!(r > RFLOOR && p > PFLOOR)) {
-    // Density or pressure would go negative: redo this cell with first-order fluxes.
+  if (!(r > DROP * r0 && p > DROP * C0.w.p)) {
+    // Troubled cell: its faces use first-order fluxes in the next stage.
     atomicAdd(&events[0], 1u);
-    let mt = k.mt;
-    k = rhs(pos, true);
-    k.mt = mt;
-    r = r0 + dt * k.m;
-    m = m0 + dt * k.mom;
-    E = e0 + dt * k.e;
-    p = gm * (E - 0.5 * dot(m, m) / r);
+    mt = -1.0 - mt;
     if (!(r > RFLOOR && p > PFLOOR)) {
       // Last resort: clamp. This is counted and reported, because it does not conserve.
       atomicAdd(&events[1], 1u);
-      if (!(r > RFLOOR)) { r = max(r0 * 0.5, RFLOOR); m = m0 * (r / r0); }
-      let ke = 0.5 * dot(m, m) / r;
-      p = gm * (E - ke);
-      if (!(p > PFLOOR)) { p = max(0.5 * gm * (e0 - 0.5 * dot(m0, m0) / r0), PFLOOR); }
-      E = p / gm + ke;
+      if (!(r > RFLOOR)) { r = max(r0 * DROP, RFLOOR); m = m0 * (r / r0); }
+      let kin = 0.5 * dot(m, m) / r;
+      p = gm * (E - kin);
+      if (!(p > PFLOOR)) { p = max(DROP * C0.w.p, PFLOOR); }
+      E = p / gm + kin;
     }
   }
   if (P.a.y > 0.0) {
@@ -341,7 +335,7 @@ fn stage(@builtin(global_invocation_id) id: vec3u) {
   dst[o + 2u] = m.y;
   dst[o + 3u] = m.z;
   dst[o + 4u] = E;
-  dst[o + 5u] = k.mt;
+  dst[o + 5u] = mt;
 }
 `;
 
@@ -370,7 +364,8 @@ fn reduceRows(@builtin(global_invocation_id) id: vec3u) {
     let W = loadPrim(c);
     if (!(W.r > 0.0 && W.p > 0.0 && W.r < 1e20 && W.p < 1e20)) { acc[8] += 1.0; continue; }
     let cs = sqrt(g * W.p / W.r);
-    let mt = src[c * 6u + 5u];
+    var mt = src[c * 6u + 5u];
+    if (mt < -0.5) { mt = -1.0 - mt; }
     // signal speed summed over the three directions, plus the viscous limit
     let visc = 6.0 * (P.b.x * max(1.0, g * P.b.z) + mt * max(1.0, g * P.b.w)) / W.r;
     acc[0] = max(acc[0], abs(W.u.x) + abs(W.u.y) + abs(W.u.z) + 3.0 * cs + visc);
@@ -387,14 +382,14 @@ fn reduceRows(@builtin(global_invocation_id) id: vec3u) {
       let nf = flagAt(pos + d);
       let nt = nf & 7u;
       if (nt == 1u) {
-        // pressure above ambient pushing the wall away from this cell
-        let pw = wallPressure(W, dot(W.u, e)) - 1.0;
+        // pressure above ambient pushing on the wall (same flux the solver uses, at first order)
+        let pw = max(dot(hllc(W, mirror(W, e), e).mom, e), 0.0) - 1.0;
         acc[4] += pw * e.x;
         acc[5] += pw * e.y;
         acc[6] += pw * e.z;
       } else if (nt >= 3u) {
         // the same flux the solver uses through this port face
-        let F = hllc(W, ghost(W, nf, -e), e);
+        let F = hllc(W, loadPrim(cidx(pos + d)), e);
         let b = KBASE + 4u * ((nf >> 6u) & 7u);
         acc[b] -= F.m;
         acc[b + 1u] += dot(F.mom, e) - 1.0;
@@ -498,18 +493,20 @@ export class CompressibleSolver {
     s.stageLayout = layout(["uniform", RO, RO, RW, RW]);
     s.diagLayout = layout(["uniform", RO, RO, RW, RW]);
     s.viewLayout = layout(["uniform", RO, RO, RW]);
-    const [stageMod, diagMod, viewMod] = await Promise.all([
+    s.ghostLayout = layout(["uniform", RW, RO]);
+    const [stageMod, diagMod, viewMod, ghostMod] = await Promise.all([
       compile(device, STAGE_WGSL, "Compressible step"),
       compile(device, DIAG_WGSL, "Compressible diagnostics"),
       compile(device, VIEW_WGSL, "Compressible view"),
+      compile(device, GHOST_WGSL, "Compressible ports"),
     ]);
     const pipe = (lay, module, entryPoint) => device.createComputePipelineAsync({
       layout: device.createPipelineLayout({ bindGroupLayouts: [lay] }), compute: { module, entryPoint },
     });
-    [s.initPipe, s.stagePipe, s.rowPipe, s.slabPipe, s.shrinkPipe] = await Promise.all([
+    [s.initPipe, s.stagePipe, s.rowPipe, s.slabPipe, s.shrinkPipe, s.ghostPipe] = await Promise.all([
       pipe(s.stageLayout, stageMod, "init"), pipe(s.stageLayout, stageMod, "stage"),
       pipe(s.diagLayout, diagMod, "reduceRows"), pipe(s.diagLayout, diagMod, "reduceSlabs"),
-      pipe(s.viewLayout, viewMod, "shrink"),
+      pipe(s.viewLayout, viewMod, "shrink"), pipe(s.ghostLayout, ghostMod, "ghosts"),
     ]);
     s.buffers = [];
     return s;
@@ -534,7 +531,8 @@ export class CompressibleSolver {
   // grid: {nx, ny, nz, dx (m), flags} from buildDomain.
   // gas: {gamma, R, mu, ambientPressure, ambientTemperature, cfl, farfield: {pressure, temperature, velocity},
   //       smagorinsky (constant, default 0.16), prandtl (0.72), turbulentPrandtl (0.9),
-  //       rampSteps (0), dtInterval (steps between time step updates, default 8)}
+  //       rampSteps (0), dtInterval (steps between time step updates, default 8),
+  //       openRelax (0.25; how firmly openings hold the outside pressure, Infinity = rigidly)}
   // ports: indexed by port number, {type: "feed", totalPressure, totalTemperature} or {type: "open", pressure, temperature}
   async setup(grid, gas, ports) {
     this.dispose();
@@ -545,7 +543,7 @@ export class CompressibleSolver {
     this.grid = grid; this.n = n;
     this.gas = {
       gamma: 1.4, R: 287.05, mu: 1.81e-5, ambientPressure: 101325, ambientTemperature: 293.15, cfl: 0.4,
-      smagorinsky: 0.16, prandtl: 0.72, turbulentPrandtl: 0.9, rampSteps: 0, dtInterval: 8, ...gas,
+      smagorinsky: 0.16, prandtl: 0.72, turbulentPrandtl: 0.9, rampSteps: 0, dtInterval: 8, openRelax: 0.25, ...gas,
     };
     const g = this.gas;
     // reference values: everything in the shader is in units of these
@@ -581,6 +579,20 @@ export class CompressibleSolver {
       });
     }
     d.queue.writeBuffer(this.flagBuf, 0, grid.flags);
+    // Port cells (inlet and open types) with the fluid cell just inside each, for the ghost pass.
+    const list = [], stride = [1, grid.nx, grid.nx * grid.ny], dims = [grid.nx, grid.ny, grid.nz];
+    for (let c = 0; c < n; c++) {
+      const f = grid.flags[c];
+      if ((f & 7) < 3) continue;
+      const face = (f >> 3) & 7, a = face >> 1, pos = a === 0 ? c % grid.nx : a === 1 ? ((c / grid.nx) | 0) % grid.ny : (c / stride[2]) | 0;
+      const q = pos + (face & 1 ? -1 : 1);
+      if (face > 5 || q < 0 || q >= dims[a]) continue;
+      const nb = c + (face & 1 ? -stride[a] : stride[a]);
+      if ((grid.flags[nb] & 7) === 0) list.push(c, nb, f);
+    }
+    this.portCells = list.length / 3;
+    this.listBuf = mk(Math.max(12, list.length * 4), S | CD);
+    d.queue.writeBuffer(this.listBuf, 0, new Uint32Array(list.length ? list : 3));
     const group = (layout, list) => d.createBindGroup({ layout, entries: list.map((buffer, binding) => ({ binding, resource: { buffer } })) });
     // stage one reads the state and writes the scratch copy; stage two reads the scratch copy
     // and blends it into the state in place. The current state is always state[0].
@@ -588,6 +600,7 @@ export class CompressibleSolver {
       group(this.stageLayout, [this.params[0], this.state[0], this.flagBuf, this.state[1], this.eventBuf]),
       group(this.stageLayout, [this.params[1], this.state[1], this.flagBuf, this.state[0], this.eventBuf]),
     ];
+    this.ghostGroups = this.state.map((st) => group(this.ghostLayout, [this.params[0], st, this.listBuf]));
     this.diagGroup = group(this.diagLayout, [this.params[2], this.state[0], this.flagBuf, this.rowBuf, this.slabBuf]);
     this.work = [Math.ceil(grid.nx / 4), Math.ceil(grid.ny / 4), Math.ceil(grid.nz / 4)];
     this.reset();
@@ -625,10 +638,13 @@ export class CompressibleSolver {
         f[o] = 1;
         f[o + 1] = (p?.pressure ?? far?.pressure ?? this.pRef) / this.pRef;
         f[o + 2] = (p?.temperature ?? far?.temperature ?? this.TRef) / this.TRef;
+        // fraction of the way the face pressure moves to the outside pressure per stage:
+        // openRelax divided by the longest side of the grid in cells (see openGhost in the shader)
+        f[o + 3] = Math.min(1, gas.openRelax / Math.max(g.nx, g.ny, g.nz));
       }
     }
     const q = this.device.queue;
-    u.set([g.nx, g.ny, g.nz, 0]);
+    u.set([g.nx, g.ny, g.nz, this.portCells]);
     q.writeBuffer(this.params[0], 0, buf);
     f[1] = 0.5; f[2] = 0.5;
     q.writeBuffer(this.params[1], 0, buf);
@@ -656,14 +672,28 @@ export class CompressibleSolver {
   // (density, velocity x y z, pressure in SI units; the rest is ignored). For tests and restarts.
   setState(fields) {
     const n = this.n, a = new Float32Array(n * CELL), gi = 1 / (this.gas.gamma - 1);
+    const far = this.gas.farfield, flags = this.grid.flags;
     for (let c = 0; c < n; c++) {
-      const r = fields[8 * c] / this.rhoRef, p = fields[8 * c + 4] / this.pRef;
-      const u = fields[8 * c + 1] / this.uRef, v = fields[8 * c + 2] / this.uRef, w = fields[8 * c + 3] / this.uRef;
+      let r = fields[8 * c] / this.rhoRef, p = fields[8 * c + 4] / this.pRef;
+      let u = fields[8 * c + 1] / this.uRef, v = fields[8 * c + 2] / this.uRef, w = fields[8 * c + 3] / this.uRef;
+      if ((flags[c] & 7) === 2 && far) {
+        // far field cells always hold the far field flow
+        p = far.pressure / this.pRef; r = p / (far.temperature / this.TRef);
+        [u, v, w] = far.velocity.map((q) => q / this.uRef);
+      }
       a.set([r, r * u, r * v, r * w, p * gi + 0.5 * r * (u * u + v * v + w * w), 0], CELL * c);
     }
     this.device.queue.writeBuffer(this.state[0], 0, a);
     this.device.queue.writeBuffer(this.state[1], 0, a);
     this.dt = 0; this.sinceDt = 0; this.settle = 16;
+  }
+
+  // Refreshes the port cells of one state copy from the fluid cells inside them.
+  ghostPass(pass, which) {
+    if (!this.portCells) return;
+    pass.setPipeline(this.ghostPipe);
+    pass.setBindGroup(0, this.ghostGroups[which]);
+    pass.dispatchWorkgroups(Math.ceil(this.portCells / 64));
   }
 
   // Runs the reduction passes and reads one short record per z slab.
@@ -674,6 +704,7 @@ export class CompressibleSolver {
     new Uint32Array(buf, 0, 4)[3] = full ? 1 : 0;
     d.queue.writeBuffer(this.params[2], 0, buf);
     const enc = d.createCommandEncoder(), pass = enc.beginComputePass();
+    this.ghostPass(pass, 0);
     pass.setBindGroup(0, this.diagGroup);
     pass.setPipeline(this.rowPipe);
     pass.dispatchWorkgroups(Math.ceil(g.ny / 8), Math.ceil(g.nz / 8));
@@ -723,10 +754,13 @@ export class CompressibleSolver {
       const m = Math.min(k - done, every - this.sinceDt);
       this.writeParams(this.dt);
       const enc = d.createCommandEncoder(), pass = enc.beginComputePass();
-      pass.setPipeline(this.stagePipe);
       for (let s = 0; s < m; s++) {
-        pass.setBindGroup(0, this.groups[0]); pass.dispatchWorkgroups(...this.work);
-        pass.setBindGroup(0, this.groups[1]); pass.dispatchWorkgroups(...this.work);
+        for (const h of [0, 1]) {
+          this.ghostPass(pass, h);
+          pass.setPipeline(this.stagePipe);
+          pass.setBindGroup(0, this.groups[h]);
+          pass.dispatchWorkgroups(...this.work);
+        }
       }
       pass.end();
       d.queue.submit([enc.finish()]);
