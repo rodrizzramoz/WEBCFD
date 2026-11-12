@@ -25,8 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("FLOWBENCH_PORT", "8765"))
 TOKEN = os.environ.get("FLOWBENCH_TOKEN") or secrets.token_urlsafe(9)
 ALLOWED = {
-    "0/U", "0/p", "0/k", "0/omega", "0/nut",
-    "constant/transportProperties", "constant/turbulenceProperties", "constant/triSurface/model.stl",
+    "0/U", "0/p", "0/k", "0/omega", "0/nut", "0/T", "0/alphat",
+    "constant/transportProperties", "constant/thermophysicalProperties", "constant/turbulenceProperties", "constant/triSurface/model.stl",
     "system/blockMeshDict", "system/snappyHexMeshDict", "system/topoSetDict", "system/createPatchDict",
     "system/controlDict", "system/fvSchemes", "system/fvSolution",
 }
@@ -135,8 +135,12 @@ def run_job(job, files):
         steps = [["blockMesh"], ["snappyHexMesh", "-overwrite"]]
         if "system/topoSetDict" in files:
             steps += [["topoSet"], ["createPatch", "-overwrite"]]
-        steps += [["checkMesh"], ["simpleFoam"]]
-        m = re.search(r"endTime\s+(\d+)", files["system/controlDict"].decode(errors="replace"))
+        control = files["system/controlDict"].decode(errors="replace")
+        app = re.search(r"application\s+(\w+)", control)
+        solver = app.group(1) if app and app.group(1) in ("simpleFoam", "rhoPimpleFoam") else "simpleFoam"
+        steps += [["checkMesh"], [solver]]
+        job["compressible"] = solver != "simpleFoam"
+        m = re.search(r"endTime\s+(\d+)", control)
         job["of"] = int(m.group(1)) if m else 0
         for cmd in steps:
             if job.get("cancel"):
@@ -148,7 +152,7 @@ def run_job(job, files):
                 job["proc"] = proc
                 while proc.poll() is None:
                     time.sleep(0.5)
-                    if cmd[0] == "simpleFoam":
+                    if cmd[0] == solver:
                         try:
                             with open(log, "rb") as r:
                                 r.seek(max(0, os.path.getsize(log) - 4000))
@@ -169,6 +173,7 @@ def run_job(job, files):
                 fatal = text.find("FOAM FATAL")
                 raise RuntimeError(cmd[0] + " failed: " + (text[fatal:fatal + 600] if fatal >= 0 else tail[-600:]).strip())
         job["results"] = results(case)
+        job["results"]["compressible"] = job["compressible"]
         job["state"] = "done"
     except Exception as e:  # report every failure to the page
         job["state"] = "cancelled" if job.get("cancel") else "failed"

@@ -102,7 +102,7 @@ export function buildCase(tris, opt, phys, settings = {}) {
       for (let b = 0; b < 3; b++) if (b !== a) { lo[b] -= 0.6 * dx; hi[b] += 0.6 * dx; }
       const name = (p.type === "feed" ? "feed" : "open") + (n + 1);
       sets.push({ name, lo, hi, base: PATCH[p.face] });
-      patches.push({ name, kind: p.type === "feed" ? "inlet" : "open", speed: p.speed, normal: NORMALS[p.face] });
+      patches.push({ name, kind: p.type === "feed" ? "inlet" : "open", speed: p.speed, pressure: p.pressure, normal: NORMALS[p.face] });
     });
   } else {
     refLength = grid.refLength;
@@ -415,11 +415,14 @@ ${sets.length ? "topoSet > log.topoSet 2>&1\ncreatePatch -overwrite > log.create
 simpleFoam > log.simpleFoam 2>&1
 echo "Done. Results are in postProcessing/ and the last time folder."
 `;
+  const compressible = !!settings.compressible;
+  if (compressible && external) throw new Error("The compressible export covers flow through a part for now. Use Through the part with custom ports.");
   const summary = {
+    compressible,
     mode: external ? "external" : grid.portMode ? "ports" : "internal", reynolds: Re, laminar,
     background: cells, backgroundCell: dxBase, surfaceCell: dxFine, level, inside,
     patches: patches.map((p) => ({ name: p.name, kind: p.kind, speed: p.speed || 0 })),
-    refLength, refArea, refSpeed, rho: phys.rho,
+    refLength, refArea, refSpeed, rho: compressible ? RHO_ATM : phys.rho,
   };
   files["README.txt"] = `Flowbench export for OpenFOAM
 
@@ -446,7 +449,152 @@ Notes
   solver (rhoSimpleFoam or rhoPimpleFoam) with pressure and temperature boundary conditions instead.
   To add boundary layer cells, set addLayers true in system/snappyHexMeshDict and list the model patch under layers.
 `;
+  if (compressible) compressibleCase(files, patches, { k0, omega0, dxFine, iterations: settings.iterations ?? 4000 });
   return { files, summary };
+}
+
+// Rewrites an incompressible case as compressible air (perfect gas), solved with
+// rhoPimpleFoam in local time stepping mode, which marches to a steady state and
+// copes with sonic and supersonic jets. Pressures become absolute.
+// Fed ports given as a supply pressure become reservoirs at that total pressure;
+// fed ports given as a speed keep a fixed velocity. Open ports sit at atmospheric pressure.
+const P_ATM = 101325, T_ATM = 293.15, RHO_ATM = P_ATM / (287.05 * T_ATM);
+function compressibleCase(files, patches, o) {
+  const field = (name, cls, dims, internal, per) => HEADER(cls, name, "0") + `
+dimensions      ${dims};
+internalField   uniform ${internal};
+
+boundaryField
+{
+${patches.map((p) => "    " + p.name + "\n    {\n" + per(p).split("\n").map((l) => "        " + l).join("\n") + "\n    }").join("\n")}
+}
+`;
+  const byPressure = (p) => p.kind === "inlet" && p.pressure > 0;
+  files["0/p"] = field("p", "volScalarField", "[1 -1 -2 0 0 0 0]", String(P_ATM), (p) =>
+    // the supply pressure is brought up over the first 500 iterations; switching it on at once makes the solver diverge
+    byPressure(p) ? "type            uniformTotalPressure;\ngamma           1.4;\np0              table ((0 " + Math.round(P_ATM + 0.03 * p.pressure) + ") (500 " + Math.round(P_ATM + p.pressure) + ") (10000000 " + Math.round(P_ATM + p.pressure) + "));\nvalue           uniform " + Math.round(P_ATM + 0.03 * p.pressure) + ";"
+    : p.kind === "open" ? "type            totalPressure;\ngamma           1.4;\np0              uniform " + P_ATM + ";\nvalue           uniform " + P_ATM + ";"
+    : "type            zeroGradient;");
+  files["0/U"] = field("U", "volVectorField", "[0 1 -1 0 0 0 0]", "(0 0 0)", (p) =>
+    byPressure(p) ? "type            pressureInletVelocity;\nvalue           uniform (0 0 0);"
+    : p.kind === "inlet" ? "type            fixedValue;\nvalue           uniform " + v3(p.normal.map((c) => c * p.speed)) + ";"
+    : p.kind === "open" ? "type            pressureInletOutletVelocity;\nvalue           uniform (0 0 0);"
+    : "type            noSlip;");
+  files["0/T"] = field("T", "volScalarField", "[0 0 0 1 0 0 0]", String(T_ATM), (p) =>
+    byPressure(p) ? "type            totalTemperature;\ngamma           1.4;\nT0              uniform " + T_ATM + ";\nvalue           uniform " + T_ATM + ";"
+    : p.kind === "inlet" ? "type            fixedValue;\nvalue           uniform " + T_ATM + ";"
+    : p.kind === "open" ? "type            inletOutlet;\ninletValue      uniform " + T_ATM + ";\nvalue           uniform " + T_ATM + ";"
+    : "type            zeroGradient;");
+  const turb = (name, dims, value, wallFn) => field(name, "volScalarField", dims, String(value), (p) =>
+    p.kind === "wall" ? "type            " + wallFn + ";\nvalue           uniform " + value + ";"
+    : name === "nut" || name === "alphat" ? "type            calculated;\nvalue           uniform 0;"
+    : p.kind === "inlet" ? "type            fixedValue;\nvalue           uniform " + value + ";"
+    : "type            inletOutlet;\ninletValue      uniform " + value + ";\nvalue           uniform " + value + ";");
+  files["0/k"] = turb("k", "[0 2 -2 0 0 0 0]", Number(o.k0.toPrecision(5)), "kqRWallFunction");
+  files["0/omega"] = turb("omega", "[0 0 -1 0 0 0 0]", Number(o.omega0.toPrecision(5)), "omegaWallFunction");
+  files["0/nut"] = turb("nut", "[0 2 -1 0 0 0 0]", 0, "nutkWallFunction");
+  files["0/alphat"] = turb("alphat", "[1 -1 -1 0 0 0 0]", 0, "compressible::alphatWallFunction");
+  delete files["constant/transportProperties"];
+  files["constant/thermophysicalProperties"] = HEADER("dictionary", "thermophysicalProperties", "constant") + `
+thermoType
+{
+    type            hePsiThermo;
+    mixture         pureMixture;
+    transport       const;
+    thermo          hConst;
+    equationOfState perfectGas;
+    specie          specie;
+    energy          sensibleInternalEnergy;
+}
+mixture
+{
+    specie          { molWeight 28.96; }
+    thermodynamics  { Cp 1005; Hf 0; }
+    transport       { mu 1.825e-05; Pr 0.71; }
+}
+`;
+  files["constant/turbulenceProperties"] = HEADER("dictionary", "turbulenceProperties", "constant") + `
+simulationType  RAS;
+RAS
+{
+    RASModel        kOmegaSST;
+    turbulence      on;
+    printCoeffs     on;
+}
+`;
+  files["system/fvSchemes"] = HEADER("dictionary", "fvSchemes", "system") + `
+ddtSchemes      { default localEuler; }
+gradSchemes     { default cellLimited Gauss linear 1; }
+divSchemes
+{
+    default         none;
+    div(phi,U)      Gauss linearUpwind grad(U);
+    div(phi,e)      Gauss limitedLinear 1;
+    div(phi,K)      Gauss limitedLinear 1;
+    div(phi,Ekp)    Gauss limitedLinear 1;
+    div(phiv,p)     Gauss limitedLinear 1;
+    div(phid,p)     Gauss limitedLinear 1;
+    div(phi,k)      Gauss upwind;
+    div(phi,omega)  Gauss upwind;
+    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
+}
+laplacianSchemes { default Gauss linear limited 0.5; }
+interpolationSchemes { default linear; }
+snGradSchemes   { default limited 0.5; }
+wallDist        { method meshWave; }
+`;
+  files["system/fvSolution"] = HEADER("dictionary", "fvSolution", "system") + `
+solvers
+{
+    "(p|rho)"
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-8;
+        relTol          0.05;
+    }
+    "(p|rho)Final"
+    {
+        $p;
+        relTol          0;
+    }
+    "(U|e|k|omega)"
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-8;
+        relTol          0.1;
+    }
+    "(U|e|k|omega)Final"
+    {
+        $U;
+        relTol          0;
+    }
+}
+PIMPLE
+{
+    momentumPredictor yes;
+    transonic       yes;
+    nOuterCorrectors 1;
+    nCorrectors     2;
+    nNonOrthogonalCorrectors 1;
+    maxCo           0.2;
+    rDeltaTSmoothingCoeff 0.1;
+    rDeltaTDampingCoeff 1;
+    maxDeltaT       ${(10 * o.dxFine / 343).toExponential(2)};
+    pMinFactor      0.1;
+    pMaxFactor      12;
+}
+relaxationFactors
+{
+    equations { ".*" 1; }
+}
+`;
+  files["system/controlDict"] = files["system/controlDict"].replace("application     simpleFoam;", "application     rhoPimpleFoam;")
+    .replace(/endTime         \d+;/, "endTime         " + o.iterations + ";").replace(/writeInterval   \d+;/, "writeInterval   " + o.iterations + ";");
+  files["Allrun"] = files["Allrun"].replace("simpleFoam > log.simpleFoam 2>&1", "rhoPimpleFoam > log.rhoPimpleFoam 2>&1");
+  files["README.txt"] = files["README.txt"].replace("steady incompressible flow (simpleFoam)", "compressible air as a perfect gas, marched to a steady state (rhoPimpleFoam with local time stepping)")
+    .replace(/Notes\n[\s\S]*?To add boundary/, "Notes\n  Pressures in this case are absolute, in pascals. Flow rates on patches are mass flows in kg/s.\n  To add boundary");
 }
 
 export { FACE_NAMES };

@@ -14,8 +14,8 @@ export async function runnerStatus() {
 
 // Sends the case and polls until it finishes. onStatus(text) is called as it goes.
 // Returns {summary, results} or throws an Error with a readable message.
-export async function solveWithOpenFoam(tris, opt, phys, token, onStatus, isCancelled) {
-  const c = buildCase(tris, opt, phys, { functions: false, ascii: true, iterations: 1500 });
+export async function solveWithOpenFoam(tris, opt, phys, token, onStatus, isCancelled, compressible) {
+  const c = buildCase(tris, opt, phys, { functions: false, ascii: true, iterations: compressible ? 4000 : 1500, compressible });
   const entries = {};
   for (const [path, data] of Object.entries(c.files)) entries[path] = typeof data === "string" ? strToU8(data) : data;
   onStatus("Sending the case to OpenFOAM...");
@@ -25,13 +25,13 @@ export async function solveWithOpenFoam(tris, opt, phys, token, onStatus, isCanc
   catch (e) { throw new Error("The OpenFOAM runner is not reachable. Start server/flowbench_openfoam_server.py on this computer first."); }
   const started = await r.json();
   if (!r.ok) throw new Error(r.status === 401 ? "The access code is wrong. Copy it from the window where the runner was started." : started.error || "the runner refused the case");
-  const names = { blockMesh: "Building the background mesh", snappyHexMesh: "Fitting the mesh to the model surface", topoSet: "Marking the ports", createPatch: "Marking the ports", checkMesh: "Checking the mesh", simpleFoam: "Solving" };
+  const names = { blockMesh: "Building the background mesh", snappyHexMesh: "Fitting the mesh to the model surface", topoSet: "Marking the ports", createPatch: "Marking the ports", checkMesh: "Checking the mesh", simpleFoam: "Solving", rhoPimpleFoam: "Solving (compressible)" };
   for (;;) {
     await new Promise((res) => setTimeout(res, 1000));
     if (isCancelled && isCancelled()) { fetch(BASE + "/job/" + started.job + "/cancel", { method: "POST", headers: head }).catch(() => {}); throw new Error("Stopped."); }
     const j = await (await fetch(BASE + "/job/" + started.job, { headers: head, cache: "no-store" })).json();
     if (j.state === "running") {
-      onStatus("OpenFOAM: " + (names[j.stage] || j.stage) + (j.stage === "simpleFoam" ? ", iteration " + j.step + " of at most " + j.of : "") + (j.cells ? " (" + j.cells + " cells)" : ""));
+      onStatus("OpenFOAM: " + (names[j.stage] || j.stage) + (j.stage === "simpleFoam" || j.stage === "rhoPimpleFoam" ? ", iteration " + j.step + " of at most " + j.of : "") + (j.cells ? " (" + j.cells + " cells)" : ""));
       continue;
     }
     if (j.state !== "done") throw new Error(j.error || "the run failed");
@@ -47,6 +47,19 @@ export function describe(run) {
     const f = P.model.pressureForceOverRho.map((v) => v * rho), q = 0.5 * rho * s.refSpeed ** 2 * s.refArea;
     rows.push(["Drag coefficient (pressure part)", (f[0] / q).toPrecision(3)], ["Lift coefficient (pressure part)", (f[2] / q).toPrecision(3)],
       ["Drag force (pressure part)", f[0].toPrecision(3) + " N"], ["Lift force (pressure part)", f[2].toPrecision(3) + " N"]);
+  } else if (s.compressible) {
+    // compressible runs report mass flow in kg/s and absolute pressure in Pa
+    let fed = 0, drawn = 0;
+    const air = (kg) => (kg * 1000).toPrecision(3) + " g/s (" + (kg / rho * 3600).toPrecision(3) + " m3/h of free air)";
+    for (const p of s.patches) {
+      const d = P[p.name];
+      if (!d || p.kind === "wall") continue;
+      const m = -d.flow;
+      if (p.kind === "inlet") fed += m; else if (m > 0) drawn += m;
+      rows.push([p.name + (p.kind === "inlet" ? " (fed)" : m >= 0 ? " (open, drawing in)" : " (open, blowing out)"),
+        air(Math.abs(m)) + ", " + ((d.pOverRho - 101325) / 1e5).toPrecision(3) + " bar gauge"]);
+    }
+    rows.unshift(["Amplification by mass (air drawn in per air fed)", fed > 0 ? (drawn / fed).toPrecision(3) + " x" : "-"]);
   } else {
     let fed = 0, drawn = 0, out = 0;
     for (const p of s.patches) {

@@ -44,7 +44,7 @@ The runner listens on 127.0.0.1 only, needs the access code on every request, ac
 
 Both were checked against OpenFOAM v1912 (the Ubuntu package). In that particular package every function object fails at start-up, so the export's built-in reporting block (force coefficients, patch flow rates) could not be exercised there; the runner does not use it and computes the numbers from the written fields instead. On Windows, OpenFOAM needs WSL or Docker.
 
-The exported case is steady and incompressible. A compressed-air jet near the speed of sound needs a compressible solver and pressure boundary conditions; the case README says which.
+By default the exported case is steady and incompressible. Tick "Treat air as compressible" for parts fed with compressed air: fed openings set by supply pressure become reservoirs at that pressure, air is a perfect gas, and the case is solved with rhoPimpleFoam in local time stepping mode, with the supply pressure brought up gradually so the solver stays stable. Checked on the air mover demo at 2 bar gauge: the nozzle chokes and passes 19.7 g/s against 20.1 g/s from nozzle theory (25,000 cells), and the page shows mass flow per opening and the amplification by mass.
 
 ## Run it
 

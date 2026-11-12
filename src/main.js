@@ -456,7 +456,7 @@ function setPortRole(i, role, change) {
 function showFoamResult(run) {
   let box = $("foamTable");
   if (!box) { box = document.createElement("div"); box.id = "foamTable"; box.className = "chartbox"; $("tiles").after(box); }
-  box.innerHTML = '<div class="head"><span class="lbl">OpenFOAM result for this setup (steady, body-fitted mesh)</span></div><table class="porttable">' +
+  box.innerHTML = '<div class="head"><span class="lbl">OpenFOAM result for this setup (steady, body-fitted mesh' + (run.summary.compressible ? ", compressible air" : "") + ')</span></div><table class="porttable">' +
     describe(run).map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>").join("") + "</table>";
   box.hidden = false;
 }
@@ -1088,7 +1088,7 @@ function wire() {
     if (!token) { notify("Paste the access code that the runner printed when it started.", true); return; }
     foamBusy = true; foamCancel = false; $("foamRun").disabled = true; $("foamStop").disabled = false;
     try {
-      const run = await solveWithOpenFoam(tris, options(), { rho: state.rho, mu: state.mu, speed: state.speed }, token, (t) => { $("foamInfo").textContent = t; }, () => foamCancel);
+      const run = await solveWithOpenFoam(tris, options(), { rho: state.rho, mu: state.mu, speed: state.speed }, token, (t) => { $("foamInfo").textContent = t; }, () => foamCancel, $("foamComp").checked);
       showFoamResult(run);
       $("foamInfo").textContent = "OpenFOAM finished after " + run.results.time + " iterations on " + fmtBig(run.cells) + " cells. The numbers are in the table under the readouts.";
     } catch (e) { $("foamInfo").textContent = "OpenFOAM: " + e.message; notify("OpenFOAM: " + e.message, true); }
@@ -1098,7 +1098,7 @@ function wire() {
   $("foamBtn").addEventListener("click", () => {
     if (!tris) return;
     try {
-      const c = buildCase(tris, options(), { rho: state.rho, mu: state.mu, speed: state.speed });
+      const c = buildCase(tris, options(), { rho: state.rho, mu: state.mu, speed: state.speed }, { compressible: $("foamComp").checked });
       const entries = {};
       for (const [path, data] of Object.entries(c.files)) entries["flowbench-openfoam/" + path] = typeof data === "string" ? strToU8(data) : data;
       const url = URL.createObjectURL(new Blob([zipSync(entries)], { type: "application/zip" }));

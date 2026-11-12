@@ -1,0 +1,369 @@
+<!DOCTYPE html><html><body><script type="module">
+// Solver-only checks for src/compressible.js. Each window.* function runs one check and
+// returns plain numbers; they are driven headlessly (see docs/COMPRESSIBLE.md).
+import { CompressibleSolver } from "/src/compressible.js";
+import { buildDomain } from "/src/domain.js";
+import { DEMOS } from "/src/demos.js";
+import { nozzle } from "/src/airjet.js";
+
+const AIR = { gamma: 1.4, R: 287.05, mu: 1.81e-5, ambientPressure: 101325, ambientTemperature: 293.15, cfl: 0.4 };
+const RHO = AIR.ambientPressure / (AIR.R * AIR.ambientTemperature), P0 = AIR.ambientPressure;
+const UREF = Math.sqrt(P0 / RHO), CAMB = Math.sqrt(1.4) * UREF;
+const FACE = { xmin: 0, xmax: 1, ymin: 2, ymax: 3, zmin: 4, zmax: 5 };
+const r4 = (v) => +v.toPrecision(4);
+
+function makeGrid(nx, ny, nz, dx, fn) {
+  const flags = new Uint32Array(nx * ny * nz);
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) flags[i + nx * (j + ny * k)] = fn(i, j, k);
+  return { nx, ny, nz, n: nx * ny * nz, dx, flags };
+}
+const fluidCount = (grid) => { let c = 0; for (const f of grid.flags) if ((f & 7) === 0) c++; return c; };
+function ambientState(grid, fn) {
+  const a = new Float32Array(grid.n * 8);
+  for (let k = 0; k < grid.nz; k++) for (let j = 0; j < grid.ny; j++) for (let i = 0; i < grid.nx; i++) {
+    const c = i + grid.nx * (j + grid.ny * k), s = fn ? fn(i, j, k) : null;
+    a.set(s || [RHO, 0, 0, 0, P0], 8 * c);
+  }
+  return a;
+}
+let solver = null;
+async function getSolver() { if (!solver) solver = await CompressibleSolver.create(); return solver; }
+
+// Exact solution of the Riemann problem (Toro). States are {r, u, p}; returns a function of x / t.
+function exactRiemann(l, r, g) {
+  const cl = Math.sqrt(g * l.p / l.r), cr = Math.sqrt(g * r.p / r.r);
+  const f = (p, s, c) => p > s.p
+    ? (p - s.p) * Math.sqrt((2 / ((g + 1) * s.r)) / (p + (g - 1) / (g + 1) * s.p))
+    : 2 * c / (g - 1) * (Math.pow(p / s.p, (g - 1) / (2 * g)) - 1);
+  let lo = 1e-9 * Math.min(l.p, r.p), hi = 20 * Math.max(l.p, r.p);
+  for (let it = 0; it < 200; it++) {
+    const mid = 0.5 * (lo + hi);
+    if (f(mid, l, cl) + f(mid, r, cr) + r.u - l.u > 0) hi = mid; else lo = mid;
+  }
+  const ps = 0.5 * (lo + hi), us = 0.5 * (l.u + r.u) + 0.5 * (f(ps, r, cr) - f(ps, l, cl));
+  const gp = (g + 1) / (2 * g), gmm = (g - 1) / (2 * g), gr = (g - 1) / (g + 1);
+  return (xi) => {
+    if (xi <= us) {
+      if (ps > l.p) {
+        const S = l.u - cl * Math.sqrt(gp * ps / l.p + gmm);
+        return xi < S ? l : { r: l.r * (ps / l.p + gr) / (gr * ps / l.p + 1), u: us, p: ps };
+      }
+      const cs = cl * Math.pow(ps / l.p, gmm);
+      if (xi < l.u - cl) return l;
+      if (xi > us - cs) return { r: l.r * Math.pow(ps / l.p, 1 / g), u: us, p: ps };
+      const c = 2 / (g + 1) * (cl + (g - 1) / 2 * (l.u - xi));
+      return { r: l.r * Math.pow(c / cl, 2 / (g - 1)), u: 2 / (g + 1) * (cl + (g - 1) / 2 * l.u + xi), p: l.p * Math.pow(c / cl, 2 * g / (g - 1)) };
+    }
+    if (ps > r.p) {
+      const S = r.u + cr * Math.sqrt(gp * ps / r.p + gmm);
+      return xi > S ? r : { r: r.r * (ps / r.p + gr) / (gr * ps / r.p + 1), u: us, p: ps };
+    }
+    const cs = cr * Math.pow(ps / r.p, gmm);
+    if (xi > r.u + cr) return r;
+    if (xi < us + cs) return { r: r.r * Math.pow(ps / r.p, 1 / g), u: us, p: ps };
+    const c = 2 / (g + 1) * (cr - (g - 1) / 2 * (r.u - xi));
+    return { r: r.r * Math.pow(c / cr, 2 / (g - 1)), u: 2 / (g + 1) * (-cr + (g - 1) / 2 * r.u + xi), p: r.p * Math.pow(c / cr, 2 * g / (g - 1)) };
+  };
+}
+
+// 1. Sod shock tube along one axis, in a duct of 2 x 2 fluid cells with solid walls all round.
+window.sod = async (axis, N, opts = {}) => {
+  const dims = [4, 4, 4]; dims[axis] = N + 2;
+  const dx = 1 / N;
+  const along = (i, j, k) => [i, j, k][axis];
+  const grid = makeGrid(dims[0], dims[1], dims[2], dx, (i, j, k) => {
+    const p = [i, j, k];
+    for (let a = 0; a < 3; a++) if (p[a] < 1 || p[a] > dims[a] - 2) return 1;
+    return 0;
+  });
+  const s = await getSolver();
+  await s.setup(grid, { ...AIR, mu: 0, smagorinsky: 0, ...(opts.gas || {}) }, []);
+  s.setState(ambientState(grid, (i, j, k) => (along(i, j, k) <= N / 2 ? null : [0.125 * RHO, 0, 0, 0, 0.1 * P0])));
+  const T = 0.2 / UREF; // 0.2 in the usual units of the problem (tube length 1, left state density 1, pressure 1)
+  while (s.time < T && !s.diverged) {
+    const left = s.dt ? Math.floor((T - s.time) / (s.dt * s.tRef)) : 1;
+    await s.step(Math.max(1, Math.min(left, 200)));
+  }
+  const out = await s.read(), f = out.fields;
+  const exact = exactRiemann({ r: RHO, u: 0, p: P0 }, { r: 0.125 * RHO, u: 0, p: 0.1 * P0 }, 1.4);
+  let e = [0, 0, 0], cross = 0, trans = 0;
+  const profile = [];
+  for (let m = 1; m <= N; m++) {
+    const p = [1, 1, 1]; p[axis] = m;
+    const c = p[0] + grid.nx * (p[1] + grid.ny * p[2]);
+    const x = (m - 0.5 - N / 2) * dx, ex = exact(x / out.time);
+    e[0] += Math.abs(f[8 * c] - ex.r) / RHO;
+    e[1] += Math.abs(f[8 * c + 1 + axis] - ex.u) / UREF;
+    e[2] += Math.abs(f[8 * c + 4] - ex.p) / P0;
+    // the other three cells of the cross-section must match, and nothing may move sideways
+    for (const [a, b] of [[2, 1], [1, 2], [2, 2]]) {
+      const q = [a, b, 0]; const pp = [0, 0, 0]; let n = 0;
+      for (let d = 0; d < 3; d++) pp[d] = d === axis ? m : q[n++];
+      const c2 = pp[0] + grid.nx * (pp[1] + grid.ny * pp[2]);
+      cross = Math.max(cross, Math.abs(f[8 * c2] - f[8 * c]) / RHO);
+    }
+    for (let d = 0; d < 3; d++) if (d !== axis) trans = Math.max(trans, Math.abs(f[8 * c + 1 + d]) / UREF);
+    if (opts.profile) profile.push([r4(x), r4(f[8 * c] / RHO), r4(f[8 * c + 1 + axis] / UREF), r4(f[8 * c + 4] / P0), r4(ex.r / RHO), r4(ex.u / UREF), r4(ex.p / P0)]);
+  }
+  return { axis, N, steps: s.steps, time: out.time * UREF, L1: e.map((v) => +(v / N).toExponential(3)), crossDiff: cross, transverse: trans, fallbacks: out.firstOrderFallbacks, clamps: out.clamps, profile };
+};
+
+// 2. Closed box with a solid block inside and a lumpy, swirling start: mass and energy must not drift.
+window.box = async (n = 24, nsteps = 300, every = 100) => {
+  const grid = makeGrid(n, n, n, 0.001, (i, j, k) => {
+    if (i < 1 || j < 1 || k < 1 || i > n - 2 || j > n - 2 || k > n - 2) return 1;
+    if (i > 5 && i < 10 && j > 8 && j < 14 && k > 3 && k < 9) return 1;
+    return 0;
+  });
+  const s = await getSolver();
+  await s.setup(grid, AIR, []);
+  const h = n / 2;
+  s.setState(ambientState(grid, (i, j, k) => {
+    const x = (i - h) / n, y = (j - h) / n, z = (k - h) / n, q = Math.exp(-40 * ((x - 0.15) ** 2 + y * y + (z + 0.1) ** 2));
+    return [RHO * (1 + 0.3 * Math.sin(9 * x) * Math.cos(7 * y)), 0.4 * UREF * -y * 3, 0.4 * UREF * x * 3, 0.2 * UREF * Math.sin(6 * z), P0 * (1 + 1.5 * q)];
+  }));
+  const sums = async () => {
+    const r = await s.read(), f = r.fields;
+    let m = 0, e = 0;
+    for (let c = 0; c < grid.n; c++) if ((grid.flags[c] & 7) === 0) {
+      const o = 8 * c, rho = f[o];
+      m += rho; e += f[o + 4] / 0.4 + 0.5 * rho * (f[o + 1] ** 2 + f[o + 2] ** 2 + f[o + 3] ** 2);
+    }
+    return { steps: s.steps, cpuMass: m * 1e-9, cpuEnergy: e * 1e-9, gpuMass: r.mass, gpuEnergy: r.energy, maxMach: r.maxMach, fallbacks: r.firstOrderFallbacks, clamps: r.clamps, bad: r.bad };
+  };
+  const rows = [await sums()];
+  for (let t = 0; t < nsteps; t += every) { await s.step(every); rows.push(await sums()); }
+  const a = rows[0], rel = (k) => rows.map((r) => +((r[k] - a[k]) / a[k]).toExponential(2));
+  return { cells: grid.n, fluid: fluidCount(grid), massDrift: rel("cpuMass"), energyDrift: rel("cpuEnergy"), gpuMassDrift: rel("gpuMass"), gpuEnergyDrift: rel("gpuEnergy"), maxMach: rows.map((r) => r4(r.maxMach)), fallbacks: rows.at(-1).fallbacks, clamps: rows.at(-1).clamps, bad: rows.at(-1).bad };
+};
+
+// 3. Round converging nozzle (staircase walls) from a feed port, blowing into open surroundings.
+function nozzleGrid(o) {
+  const { Rin, Rt, Lp, Ln, Lc, W, dx } = o; // radii and lengths in cells, W = chamber width in cells
+  const ny = W + 2, nz = W + 2, nx = 1 + Lp + Ln + Lc + 1, x1 = Lp + Ln; // last nozzle slice
+  const cy = ny / 2, cz = nz / 2;
+  let throat = 0, inlet = 0;
+  const grid = makeGrid(nx, ny, nz, dx, (i, j, k) => {
+    const rr = Math.hypot(j + 0.5 - cy, k + 0.5 - cz);
+    if (i <= x1) {
+      const R = i <= Lp ? Rin : Rin + (Rt - Rin) * (i - Lp) / Ln;
+      if (rr >= R) return 1;
+      if (i === 0) { inlet++; return 3 | (FACE.xmin << 3) | (0 << 6); }
+      if (i === x1) throat++;
+      return 0;
+    }
+    const edge = (j === 0 || j === ny - 1 ? 1 : 0) + (k === 0 || k === nz - 1 ? 1 : 0) + (i === nx - 1 ? 1 : 0);
+    if (edge > 1) return 1;
+    if (i === nx - 1) return 4 | (FACE.xmax << 3) | (1 << 6);
+    if (j === 0) return 4 | (FACE.ymin << 3) | (1 << 6);
+    if (j === ny - 1) return 4 | (FACE.ymax << 3) | (1 << 6);
+    if (k === 0) return 4 | (FACE.zmin << 3) | (1 << 6);
+    if (k === nz - 1) return 4 | (FACE.zmax << 3) | (1 << 6);
+    return 0;
+  });
+  return { grid, throatCells: throat, inletCells: inlet, x1, cy, cz };
+}
+window.nozzleRun = async (gaugeBar, opts = {}) => {
+  const o = { Rin: 8, Rt: 4, Lp: 6, Ln: 12, Lc: 24, W: 24, dx: 0.0005, maxSteps: 4000, every: 200, tol: 0.002, ...opts };
+  const { grid, throatCells, inletCells, x1 } = nozzleGrid(o);
+  const s = await getSolver();
+  const p0 = P0 + gaugeBar * 1e5;
+  await s.setup(grid, { ...AIR, ...(o.gas || {}) }, [{ type: "feed", totalPressure: p0, totalTemperature: 293.15 }, { type: "open", pressure: P0, temperature: 293.15 }]);
+  const area = throatCells * o.dx * o.dx, ideal = nozzle(gaugeBar * 1e5, area);
+  const hist = [];
+  let prev = 0, calm = 0, t;
+  const wall0 = performance.now();
+  while (s.steps < o.maxSteps && !s.diverged) {
+    await s.step(o.every);
+    t = await s.totals();
+    const m = t.ports[0].massFlow;
+    hist.push([s.steps, r4(m / ideal.massFlow), r4(-t.ports[1].massFlow / ideal.massFlow), r4(t.maxMach)]);
+    calm = Math.abs(m - prev) < o.tol * Math.abs(m) ? calm + 1 : 0;
+    prev = m;
+    if (calm >= 3) break;
+  }
+  const wall = (performance.now() - wall0) / 1000;
+  const r = await s.read(), f = r.fields;
+  // Mach number over the last slice of the nozzle
+  let mSum = 0, mMax = 0, cnt = 0, pSum = 0;
+  for (let k = 0; k < grid.nz; k++) for (let j = 0; j < grid.ny; j++) {
+    const c = x1 + grid.nx * (j + grid.ny * k);
+    if ((grid.flags[c] & 7) === 0) { const M = f[8 * c + 6]; mSum += M; mMax = Math.max(mMax, M); pSum += f[8 * c + 4]; cnt++; }
+  }
+  const axis = [];
+  for (let i = 1; i < grid.nx - 1; i += 2) { const c = i + grid.nx * (grid.ny / 2 + grid.ny * (grid.nz / 2)); axis.push(+f[8 * c + 6].toFixed(2)); }
+  return {
+    gaugeBar, dims: [grid.nx, grid.ny, grid.nz], fluid: fluidCount(grid), throatCells, inletCells, areaMm2: r4(area * 1e6),
+    idealChoked: ideal.choked, idealMassFlow: +ideal.massFlow.toExponential(4), massFlow: +r.ports[0].massFlow.toExponential(4),
+    ratio: r4(r.ports[0].massFlow / ideal.massFlow), outOverIn: r4(-r.ports[1].massFlow / r.ports[0].massFlow),
+    throatMachMean: r4(mSum / cnt), throatMachMax: r4(mMax), throatPressureBar: r4(pSum / cnt / 1e5), feedPressureBar: r4(r.ports[0].meanPressure / 1e5),
+    maxMach: r4(r.maxMach), steps: s.steps, timeMs: r4(r.time * 1e3), settled: calm >= 3, bad: r.bad, fallbacks: r.firstOrderFallbacks, clamps: r.clamps,
+    updatesPerSecond: Math.round(fluidCount(grid) * s.steps / wall), axisMach: axis, hist,
+  };
+};
+
+// 4. Uniform flow through an empty box of far field cells (outlet on X max, as buildDomain makes for external flow).
+window.uniform = async (mach, pulse = 0, nsteps = 400, every = 100) => {
+  const nx = 48, ny = 14, nz = 14;
+  const grid = makeGrid(nx, ny, nz, 0.002, (i, j, k) => {
+    if (i === nx - 1) return 4 | (1 << 3);
+    if (i === 0 || j === 0 || k === 0 || j === ny - 1 || k === nz - 1) return 2;
+    return 0;
+  });
+  const U = mach * CAMB, s = await getSolver();
+  await s.setup(grid, { ...AIR, farfield: { pressure: P0, temperature: 293.15, velocity: [U, 0, 0] } }, []);
+  if (pulse) s.setState(ambientState(grid, (i, j, k) => {
+    const q = Math.exp(-((i - 16) ** 2 + (j - 6.5) ** 2 + (k - 6.5) ** 2) / 8);
+    return [RHO * (1 + pulse * q / 1.4), (i === 0 || j === 0 || k === 0 || j === ny - 1 || k === nz - 1) && i < nx - 1 ? U : U, 0, 0, P0 * (1 + pulse * q)];
+  }));
+  const dev = async () => {
+    const r = await s.read(), f = r.fields;
+    let dp = 0, du = 0;
+    for (let c = 0; c < grid.n; c++) if ((grid.flags[c] & 7) === 0) {
+      dp = Math.max(dp, Math.abs(f[8 * c + 4] - P0) / P0);
+      du = Math.max(du, Math.hypot(f[8 * c + 1] - U, f[8 * c + 2], f[8 * c + 3]) / CAMB);
+    }
+    return [s.steps, +dp.toExponential(2), +du.toExponential(2), r.bad];
+  };
+  const rows = [await dev()];
+  for (let t = 0; t < nsteps; t += every) { await s.step(every); rows.push(await dev()); }
+  return { mach, pulse, flowThroughs: r4(s.time * U / (nx * grid.dx)), rows };
+};
+
+// 5. Mach 2 flow over a 15 degree wedge (staircase), two-dimensional: three fluid cells deep between slip walls.
+window.wedge = async (opts = {}) => {
+  const o = { nx: 140, ny: 62, x0: 20, angle: 15, mach: 2, passes: 3, viscous: false, ...opts };
+  const { nx, ny } = o, nz = 5, tan = Math.tan(o.angle * Math.PI / 180);
+  const grid = makeGrid(nx, ny, nz, 0.001, (i, j, k) => {
+    if (k === 0 || k === nz - 1 || j === 0) return 1;
+    if (i === 0 || j === ny - 1) return 2;
+    if (i === nx - 1) return 4 | (1 << 3);
+    if (i >= o.x0 && j - 0.5 < (i + 0.5 - o.x0) * tan) return 1;
+    return 0;
+  });
+  const U = o.mach * CAMB, s = await getSolver();
+  const gas = { ...AIR, farfield: { pressure: P0, temperature: 293.15, velocity: [U, 0, 0] } };
+  if (!o.viscous) { gas.mu = 0; gas.smagorinsky = 0; }
+  await s.setup(grid, gas, []);
+  const Tend = o.passes * nx * grid.dx / U, rows = [];
+  let last = null;
+  while (s.time < Tend && !s.diverged) {
+    await s.step(200);
+    const t = await s.totals();
+    rows.push([s.steps, r4(s.time / Tend * o.passes), r4(t.maxMach), r4(t.minPressure / P0), t.firstOrderFallbacks, t.clamps]);
+  }
+  const r = await s.read(), f = r.fields, k = 2;
+  // oblique shock theory
+  const g = 1.4, th = o.angle * Math.PI / 180, M = o.mach;
+  let beta = Math.asin(1 / M) + 1e-4;
+  for (let it = 0; it < 200; it++) {
+    const fn = (b) => Math.tan(th) - 2 / Math.tan(b) * (M * M * Math.sin(b) ** 2 - 1) / (M * M * (g + Math.cos(2 * b)) + 2);
+    const h = 1e-6; beta -= fn(beta) / ((fn(beta + h) - fn(beta - h)) / (2 * h));
+  }
+  const mn = M * Math.sin(beta), pr = 1 + 2 * g / (g + 1) * (mn * mn - 1);
+  const mn2 = Math.sqrt((1 + 0.2 * mn * mn) / (g * mn * mn - 0.2)), M2 = mn2 / Math.sin(beta - th);
+  // shock position in each row: where the pressure first passes halfway up the jump
+  const half = 1 + 0.5 * (pr - 1), pts = [];
+  for (let j = 6; j <= 30; j++) {
+    for (let i = 2; i < nx - 2; i++) {
+      const a = f[8 * (i + nx * (j + ny * k)) + 4] / P0, b = f[8 * (i + 1 + nx * (j + ny * k)) + 4] / P0;
+      if (a < half && b >= half) { pts.push([i + 0.5 + (half - a) / (b - a), j + 0.5 - 1]); break; }
+    }
+  }
+  // least squares line x = a + b y through the shock points; the shock angle is atan(1 / b)
+  let sx = 0, sy = 0, sxy = 0, syy = 0;
+  for (const [x, y] of pts) { sx += x; sy += y; sxy += x * y; syy += y * y; }
+  const nP = pts.length, slope = (nP * sxy - sx * sy) / (nP * syy - sy * sy), foot = (sx - slope * sy) / nP;
+  // pressure and Mach number in the wedge of gas between the shock and the surface
+  let pS = 0, mS = 0, cnt = 0, pMin = 1e9, pMax = 0;
+  for (let i = o.x0 + 25; i <= o.x0 + 45; i++) for (let j = 1; j < ny - 1; j++) {
+    const c = i + nx * (j + ny * k);
+    if ((grid.flags[c] & 7) !== 0) continue;
+    const y = j - 0.5, ys = (i + 0.5 - o.x0) * tan, ysh = (i + 0.5 - foot) / slope;
+    if (y > ys + 3 && y < ysh - 4) { const p = f[8 * c + 4] / P0; pS += p; mS += f[8 * c + 6]; cnt++; pMin = Math.min(pMin, p); pMax = Math.max(pMax, p); }
+  }
+  let mMin = 1e9, mMax = 0;
+  for (let c = 0; c < grid.n; c++) if ((grid.flags[c] & 7) === 0) { mMin = Math.min(mMin, f[8 * c + 6]); mMax = Math.max(mMax, f[8 * c + 6]); }
+  return {
+    cells: grid.n, fluid: fluidCount(grid), steps: s.steps, passes: r4(s.time * U / (nx * grid.dx)), bad: r.bad, fallbacks: r.firstOrderFallbacks, clamps: r.clamps,
+    theory: { shockAngle: r4(beta * 180 / Math.PI), pressureRatio: r4(pr), mach2: r4(M2) },
+    measured: { shockAngle: r4(Math.atan(1 / slope) * 180 / Math.PI), shockFootX: r4(foot), wedgeTipX: o.x0, points: nP, pressureRatio: r4(pS / cnt), pressureRange: [r4(pMin), r4(pMax)], mach2: r4(mS / cnt), samples: cnt },
+    machRange: [r4(mMin), r4(mMax)], rows,
+  };
+};
+
+// 6. The app's own air mover demo with the nozzle fed from a reservoir.
+window.jetpump = async (res, gaugeBar, maxSteps, every, opts = {}) => {
+  const d = DEMOS.jetpump;
+  let g = d.build(); if (g.index) g = g.toNonIndexed(); g.scale(0.001, 0.001, 0.001);
+  const tris = g.getAttribute("position").array;
+  const o = { mode: d.setup.mode, res, domainScale: 1, inletFace: d.setup.inletFace, outletFace: d.setup.outletFace, stlIsFluid: d.setup.stlIsFluid, walls: "exact", portMode: d.setup.portMode || "simple", ports: d.setup.ports || [] };
+  const grid = buildDomain(tris, o);
+  const s = await getSolver();
+  const ports = grid.ports.map((p) => (p.type === "feed" ? { type: "feed", totalPressure: P0 + gaugeBar * 1e5, totalTemperature: 293.15 } : { type: "open", pressure: P0, temperature: 293.15 }));
+  await s.setup(grid, { ...AIR, ...(opts.gas || {}) }, ports);
+  const area = grid.ports[0].area, ideal = nozzle(gaugeBar * 1e5, area);
+  const hist = [], wall0 = performance.now();
+  let t;
+  while (s.steps < maxSteps && !s.diverged) {
+    await s.step(every);
+    t = await s.totals();
+    const row = [s.steps, r4(t.time * 1e3), ...t.ports.map((p) => +(p.massFlow * 1e3).toFixed(4)), r4(t.ports[1].massFlow / t.ports[0].massFlow), r4(t.maxMach), t.firstOrderFallbacks, t.clamps];
+    hist.push(row);
+    console.log("jetpump " + JSON.stringify(row));
+  }
+  const wall = (performance.now() - wall0) / 1000;
+  const r = await s.read(), f = r.fields;
+  const jc = Math.floor(grid.ny / 2), kc = Math.floor(grid.nz / 2), axis = [];
+  for (let i = 1; i < grid.nx - 1; i += Math.max(1, Math.round(grid.nx / 32))) { const c = i + grid.nx * (jc + grid.ny * kc); axis.push([i, +f[8 * c + 6].toFixed(2), +(f[8 * c + 4] / 1e5).toFixed(3)]); }
+  return {
+    res, gaugeBar, dims: [grid.nx, grid.ny, grid.nz], dxMm: r4(grid.dx * 1e3), cells: grid.n, fluid: grid.fluidCells,
+    portCells: grid.ports.map((p) => p.nbr.length), portAreasMm2: grid.ports.map((p) => r4(p.area * 1e6)),
+    idealMassFlowGs: r4(ideal.massFlow * 1e3), ports: r.ports.map((p) => ({ massFlowGs: r4(p.massFlow * 1e3), momentumFlowN: r4(p.momentumFlow), meanPressureBar: r4(p.meanPressure / 1e5) })),
+    entrainment: r4(r.ports[1].massFlow / r.ports[0].massFlow), balance: r4((r.ports[0].massFlow + r.ports[1].massFlow + r.ports[2].massFlow) / r.ports[0].massFlow),
+    forceN: r.force.map(r4), maxMach: r4(r.maxMach), steps: s.steps, timeMs: r4(r.time * 1e3), dtUs: r4(r.dt * 1e6), bad: r.bad, fallbacks: r.firstOrderFallbacks, clamps: r.clamps,
+    updatesPerSecond: Math.round(grid.fluidCells * s.steps / wall), wallSeconds: Math.round(wall), axis, hist,
+  };
+};
+
+// 7. Speed on an all-fluid box, and the memory figures.
+window.speed = async (n = 48, nsteps = 40) => {
+  const grid = makeGrid(n, n, n, 0.001, (i, j, k) => (i < 1 || j < 1 || k < 1 || i > n - 2 || j > n - 2 || k > n - 2 ? 1 : 0));
+  const s = await getSolver();
+  await s.setup(grid, AIR, []);
+  s.setState(ambientState(grid, (i, j, k) => [RHO, 30 * Math.sin(j / 5), 20 * Math.cos(k / 4), 0, P0 * (1 + 0.2 * Math.exp(-((i - n / 2) ** 2 + (j - n / 2) ** 2 + (k - n / 2) ** 2) / 30))]));
+  await s.step(20);
+  const t0 = performance.now(); await s.step(nsteps); const sec = (performance.now() - t0) / 1000;
+  const t1 = performance.now(); await s.read(); const readMs = performance.now() - t1;
+  return { cells: grid.n, fluid: fluidCount(grid), steps: nsteps, seconds: r4(sec), cellUpdatesPerSecond: Math.round(grid.n * nsteps / sec), fluidUpdatesPerSecond: Math.round(fluidCount(grid) * nsteps / sec), readMs: r4(readMs), bytesPerCell: CompressibleSolver.memoryBytes(grid.n) / grid.n, bytesPerCellLarge: r4(CompressibleSolver.memoryBytes(1e7) / 1e7), maxCells: s.maxCells };
+};
+
+// The block-averaged copy for very large grids against a full readback of the same state.
+window.viewCheck = async () => {
+  const n = 24, grid = makeGrid(n, n, n, 0.001, (i, j, k) => (i < 1 || j < 1 || k < 1 || i > n - 2 || j > n - 2 || k > n - 2 || (i > 5 && i < 12 && j > 4 && j < 15 && k > 3 && k < 11) ? 1 : 0));
+  const init = ambientState(grid, (i, j, k) => [RHO * (1 + 0.2 * Math.sin(i / 3)), 50 * Math.sin(j / 4), -30 * Math.cos(k / 3), 10, P0 * (1 + 0.3 * Math.cos(i / 5 + j / 7))]);
+  const run = async (limit) => { CompressibleSolver.viewCells = limit; const s = await getSolver(); await s.setup(grid, AIR, []); s.setState(init); await s.step(10); return s.read(); };
+  const full = await run(1e12), coarse = await run(grid.n / 20);
+  CompressibleSolver.viewCells = 6e6;
+  const st = coarse.stride, [vx, vy, vz] = coarse.dims, g = 1.4;
+  let err = 0, solidOnly = 0;
+  for (let K = 0; K < vz; K++) for (let J = 0; J < vy; J++) for (let I = 0; I < vx; I++) {
+    const sum = [0, 0, 0, 0, 0]; let cnt = 0;
+    for (let dz = 0; dz < st; dz++) for (let dy = 0; dy < st; dy++) for (let dx = 0; dx < st; dx++) {
+      const i = I * st + dx, j = J * st + dy, k = K * st + dz;
+      if (i >= n || j >= n || k >= n) continue;
+      const c = i + n * (j + n * k);
+      if ((grid.flags[c] & 7) === 1) continue;
+      const o = 8 * c, r = full.fields[o], u = [full.fields[o + 1], full.fields[o + 2], full.fields[o + 3]];
+      sum[0] += r; for (let a = 0; a < 3; a++) sum[1 + a] += r * u[a];
+      sum[4] += full.fields[o + 4] / (g - 1) + 0.5 * r * (u[0] ** 2 + u[1] ** 2 + u[2] ** 2); cnt++;
+    }
+    if (!cnt) { solidOnly++; continue; }
+    const v = 8 * (I + vx * (J + vy * K)), r = sum[0] / cnt, u = [sum[1] / sum[0], sum[2] / sum[0], sum[3] / sum[0]];
+    const p = (g - 1) * (sum[4] / cnt - 0.5 * r * (u[0] ** 2 + u[1] ** 2 + u[2] ** 2));
+    err = Math.max(err, Math.abs(coarse.fields[v] - r) / RHO, Math.abs(coarse.fields[v + 1] - u[0]) / UREF, Math.abs(coarse.fields[v + 2] - u[1]) / UREF, Math.abs(coarse.fields[v + 3] - u[2]) / UREF, Math.abs(coarse.fields[v + 4] - p) / P0);
+  }
+  return { stride: st, viewDims: coarse.dims, fullLen: full.fields.length, coarseLen: coarse.fields.length, maxRelError: +err.toExponential(2), solidOnlyBlocks: solidOnly, massMatch: r4(coarse.mass / full.mass), force: [full.force.map(r4), coarse.force.map(r4)] };
+};
+window.ready = true;
+</script></body></html>

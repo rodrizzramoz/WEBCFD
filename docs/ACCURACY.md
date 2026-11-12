@@ -254,3 +254,14 @@ What this shows:
 - **Jet-driven entrainment is where the browser solver is weakest at coarse grids.** With the nozzle only 4 cells across, the jet does not mix with the surrounding air quickly enough, and the predicted amplification is roughly a quarter of what OpenFOAM and a simple momentum balance give. This has not been tested at fine grids, where it should improve. Until it has been, use the OpenFOAM export or runner for air movers, ejectors and similar parts, and treat the browser result as a picture of the flow pattern.
 
 Not verified: any of these on a real GPU or at production grid sizes; the reporting block of the exported case (force coefficients and patch flow rates through OpenFOAM function objects), because function objects do not start in the Ubuntu v1912 package. The numbers above were computed from the written fields instead.
+
+### Compressible check, 12 November 2026
+
+The compressible OpenFOAM export (rhoPimpleFoam, local time stepping, k-omega SST) was run on the air mover demo with the 6 mm nozzle fed at 2 bar gauge.
+
+| Mesh | Mass flow through the nozzle | Nozzle theory (choked, ideal) | Air drawn in per air fed, by mass |
+| --- | --- | --- | --- |
+| 6,221 cells | 21.7 g/s | 20.1 g/s | 2.2 |
+| 24,839 cells | 19.7 g/s | 20.1 g/s | 2.5 |
+
+The nozzle mass flow is within 2 percent of theory on the finer mesh, which is the part of the answer that has an exact reference. The entrainment figure has no exact reference and still moves with the mesh. Two settings were needed for stability and are built into the export: the supply pressure is ramped over the first 500 iterations, and the local time step is capped at ten cell crossing times of a sound wave.
